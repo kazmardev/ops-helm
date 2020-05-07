@@ -1,0 +1,42 @@
+#!/bin/bash
+rm -rf ~/.helm
+kubectl delete deployment.apps/tiller-deploy -n kube-system
+kubectl delete service/tiller-deploy -n kube-system
+kubectl delete clusterrolebinding tiller
+kubectl -n kube-system delete sa tiller
+
+
+kubectl -n kube-system create sa tiller
+kubectl create clusterrolebinding tiller --clusterrole cluster-admin --serviceaccount=kube-system:tiller
+helm init --service-account tiller
+helm serve &
+helm repo add local http://localhost:8879/charts
+
+rm -rf openstack-helm
+rm -rf openstack-helm-infra
+
+yum install bc jq -y
+git clone https://github.com/openstack/openstack-helm.git
+git clone https://github.com/openstack/openstack-helm-infra.git
+cd openstack-helm
+
+./tools/deployment/multinode/010-setup-client.sh
+cd ../openstack-helm-infra
+make all
+cd ../openstack-helm
+make all
+
+kubectl label nodes openstack-control-plane=enabled --all
+kubectl label nodes ceph-mon=enabled --all
+kubectl label nodes ceph-osd=enabled --all
+kubectl label nodes ceph-mds=enabled --all
+kubectl label nodes ceph-rgw=enabled --all
+kubectl label nodes ceph-mgr=enabled --all
+kubectl label nodes openvswitch=enabled --all
+kubectl label nodes openstack-compute-node=enabled --all
+
+OSH_DEPLOY_MULTINODE=True ./tools/deployment/component/common/ingress.sh
+
+
+#### little help
+# https://k2r2bai.com/2017/11/29/openstack/openstack-helm/

@@ -1,0 +1,15 @@
+---
+# Source: nova/templates/pdb-placement.yaml
+
+---
+apiVersion: policy/v1beta1
+kind: PodDisruptionBudget
+metadata:
+  name: nova-placement-api
+spec:
+  minAvailable: 0
+  selector:
+    matchLabels:
+      release_group: release-name
+      application: nova
+      component: placement

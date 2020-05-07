@@ -1,0 +1,328 @@
+---
+# Source: libvirt/templates/daemonset-libvirt.yaml
+
+
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: libvirt
+  namespace: openstack
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: release-name-libvirt
+  namespace: openstack
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: release-name-openstack-libvirt
+subjects:
+  - kind: ServiceAccount
+    name: libvirt
+    namespace: openstack
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: release-name-openstack-libvirt
+  namespace: openstack
+rules:
+  - apiGroups:
+      - ""
+      - extensions
+      - batch
+      - apps
+    verbs:
+      - get
+      - list
+    resources:
+      - pods
+
+  
+
+  
+
+  
+
+  
+    
+
+    
+    
+    
+
+    
+
+    
+
+
+    
+
+    
+
+    
+---
+
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: libvirt-libvirt-default
+type: Opaque
+data:
+  libvirtd.conf: CmF1dGhfdGNwID0gIm5vbmUiCmNhX2ZpbGUgPSAiIgpsaXN0ZW5fYWRkciA9ICIxMjcuMC4wLjEiCmxpc3Rlbl90Y3AgPSAxCmxpc3Rlbl90bHMgPSAwCmxvZ19sZXZlbCA9IDMKbG9nX291dHB1dHMgPSAiMTpmaWxlOi92YXIvbG9nL2xpYnZpcnQvbGlidmlydGQubG9nIg==
+  qemu.conf: Cmdyb3VwID0gImt2bSIKc3RkaW9faGFuZGxlciA9ICJmaWxlIgp1c2VyID0gIm5vdmEi
+    
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  annotations:
+    openstackhelm.openstack.org/release_uuid: ""
+  labels:
+    application: libvirt
+    component: libvirt
+    release_group: release-name
+  name: libvirt-libvirt-default
+spec:
+  minReadySeconds: 0
+  selector:
+    matchLabels:
+      application: libvirt
+      component: libvirt
+      release_group: release-name
+  template:
+    metadata:
+      annotations:
+        configmap-bin-hash: bc05dcea22b6ce38d5557fed60e6a0a5f70cf4907a568b6c2f76aa08b3ff07c5
+        configmap-etc-hash: ed9aec4887de0d9193358397b5f69364f118e4b330bfbf5aa4f6aa1fc1823d86
+        openstackhelm.openstack.org/release_uuid: ""
+      labels:
+        application: libvirt
+        component: libvirt
+        release_group: release-name
+    spec:
+      containers:
+      - command:
+        - /tmp/libvirt.sh
+        env:
+        - name: CEPH_CINDER_USER
+          value: cinder
+        - name: LIBVIRT_CEPH_CINDER_SECRET_UUID
+          value: 457eb676-33da-42ec-9a8c-9293d545c337
+        image: docker.io/openstackhelm/libvirt:latest-ubuntu_bionic
+        imagePullPolicy: IfNotPresent
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - bash
+              - -c
+              - kill $(cat /var/run/libvirtd.pid)
+        livenessProbe:
+          exec:
+            command:
+            - bash
+            - -c
+            - /usr/bin/virsh list
+        name: libvirt
+        readinessProbe:
+          exec:
+            command:
+            - bash
+            - -c
+            - /usr/bin/virsh list
+        securityContext:
+          privileged: true
+          readOnlyRootFilesystem: false
+        volumeMounts:
+        - mountPath: /tmp
+          name: pod-tmp
+        - mountPath: /tmp/libvirt.sh
+          name: libvirt-bin
+          readOnly: true
+          subPath: libvirt.sh
+        - mountPath: /etc/libvirt/libvirtd.conf
+          name: libvirt-etc
+          readOnly: true
+          subPath: libvirtd.conf
+        - mountPath: /etc/libvirt/qemu.conf
+          name: libvirt-etc
+          readOnly: true
+          subPath: qemu.conf
+        - mountPath: /etc/libvirt/qemu
+          name: etc-libvirt-qemu
+        - mountPath: /lib/modules
+          name: libmodules
+          readOnly: true
+        - mountPath: /var/lib/libvirt
+          mountPropagation: Bidirectional
+          name: var-lib-libvirt
+        - mountPath: /var/lib/nova
+          mountPropagation: Bidirectional
+          name: var-lib-nova
+        - mountPath: /run
+          name: run
+        - mountPath: /dev
+          name: dev
+        - mountPath: /sys/fs/cgroup
+          name: cgroup
+        - mountPath: /var/log/libvirt
+          name: logs
+        - mountPath: /etc/machine-id
+          name: machine-id
+          readOnly: true
+        - mountPath: /etc/ceph
+          mountPropagation: Bidirectional
+          name: etcceph
+        - mountPath: /tmp/client-keyring
+          name: ceph-keyring
+          readOnly: true
+          subPath: key
+      dnsPolicy: ClusterFirstWithHostNet
+      hostIPC: true
+      hostNetwork: true
+      hostPID: true
+      initContainers:
+      - command:
+        - kubernetes-entrypoint
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        - name: INTERFACE_NAME
+          value: eth0
+        - name: PATH
+          value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/
+        - name: DEPENDENCY_SERVICE
+          value: ""
+        - name: DEPENDENCY_DAEMONSET
+          value: ""
+        - name: DEPENDENCY_CONTAINER
+          value: ""
+        - name: DEPENDENCY_POD_JSON
+          value: '[{"labels":{"application":"neutron","component":"neutron-ovs-agent"},"requireSameNode":true}]'
+        - name: DEPENDENCY_CUSTOM_RESOURCE
+          value: ""
+        image: quay.io/airshipit/kubernetes-entrypoint:v1.0.0
+        imagePullPolicy: IfNotPresent
+        name: init
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 65534
+        volumeMounts: null
+      - command:
+        - /tmp/ceph-admin-keyring.sh
+        image: docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200217
+        imagePullPolicy: IfNotPresent
+        name: ceph-admin-keyring-placement
+        securityContext:
+          readOnlyRootFilesystem: false
+        volumeMounts:
+        - mountPath: /tmp
+          name: pod-tmp
+        - mountPath: /etc/ceph
+          name: etcceph
+        - mountPath: /tmp/ceph-admin-keyring.sh
+          name: libvirt-bin
+          readOnly: true
+          subPath: ceph-admin-keyring.sh
+        - mountPath: /tmp/client-keyring
+          name: ceph-keyring
+          readOnly: true
+          subPath: key
+      - command:
+        - /tmp/ceph-keyring.sh
+        env:
+        - name: CEPH_CINDER_USER
+          value: cinder
+        - name: LIBVIRT_CEPH_CINDER_SECRET_UUID
+          value: 457eb676-33da-42ec-9a8c-9293d545c337
+        image: docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200217
+        imagePullPolicy: IfNotPresent
+        name: ceph-keyring-placement
+        securityContext:
+          readOnlyRootFilesystem: false
+        volumeMounts:
+        - mountPath: /tmp
+          name: pod-tmp
+        - mountPath: /etc/ceph
+          name: etcceph
+        - mountPath: /tmp/ceph-keyring.sh
+          name: libvirt-bin
+          readOnly: true
+          subPath: ceph-keyring.sh
+        - mountPath: /etc/ceph/ceph.conf.template
+          name: ceph-etc
+          readOnly: true
+          subPath: ceph.conf
+      nodeSelector:
+        openstack-compute-node: enabled
+      securityContext:
+        runAsUser: 0
+      serviceAccountName: libvirt
+      volumes:
+      - emptyDir: {}
+        name: pod-tmp
+      - configMap:
+          defaultMode: 365
+          name: libvirt-bin
+        name: libvirt-bin
+      - name: libvirt-etc
+        secret:
+          defaultMode: 292
+          secretName: libvirt-libvirt-default
+      - hostPath:
+          path: /var/lib/openstack-helm/compute/libvirt
+        name: etcceph
+      - configMap:
+          defaultMode: 292
+          name: ceph-etc
+        name: ceph-etc
+      - name: ceph-keyring
+        secret:
+          secretName: pvc-ceph-client-key
+      - hostPath:
+          path: /lib/modules
+        name: libmodules
+      - hostPath:
+          path: /var/lib/libvirt
+        name: var-lib-libvirt
+      - hostPath:
+          path: /var/lib/nova
+        name: var-lib-nova
+      - hostPath:
+          path: /run
+        name: run
+      - hostPath:
+          path: /dev
+        name: dev
+      - hostPath:
+          path: /var/log/libvirt
+        name: logs
+      - hostPath:
+          path: /sys/fs/cgroup
+        name: cgroup
+      - hostPath:
+          path: /etc/machine-id
+        name: machine-id
+      - hostPath:
+          path: /etc/libvirt/qemu
+        name: etc-libvirt-qemu
+  updateStrategy:
+    rollingUpdate:
+      maxUnavailable: 1
+    type: RollingUpdate
+

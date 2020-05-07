@@ -1,0 +1,30 @@
+---
+# Source: ingress/templates/service-ingress.yaml
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    release_group: release-name
+    application: ingress
+    component: server
+  name: ingress
+spec:
+  ports:
+  - name: http
+    port: 80
+    protocol: TCP
+    targetPort: 80
+  - name: https
+    port: 443
+    protocol: TCP
+    targetPort: 443
+  - name: status
+    port: 10246
+    protocol: TCP
+    targetPort: 10246
+  selector:
+    release_group: release-name
+    application: ingress
+    component: server

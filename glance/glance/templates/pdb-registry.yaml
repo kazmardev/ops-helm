@@ -1,0 +1,15 @@
+---
+# Source: glance/templates/pdb-registry.yaml
+
+---
+apiVersion: policy/v1beta1
+kind: PodDisruptionBudget
+metadata:
+  name: glance-registry
+spec:
+  minAvailable: 0
+  selector:
+    matchLabels:
+      release_group: release-name
+      application: glance
+      component: registry

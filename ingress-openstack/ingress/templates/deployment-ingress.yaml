@@ -1,0 +1,321 @@
+---
+# Source: ingress/templates/deployment-ingress.yaml
+
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: release-name-ingress
+  namespace: openstack
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: release-name-ingress
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+      - endpoints
+      - nodes
+      - pods
+      - secrets
+    verbs:
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resources:
+      - services
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - "extensions"
+      - "networking.k8s.io"
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - "extensions"
+      - "networking.k8s.io"
+    resources:
+      - ingresses/status
+    verbs:
+      - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: release-name-ingress
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: release-name-ingress
+subjects:
+  - kind: ServiceAccount
+    name: release-name-ingress
+    namespace: openstack
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: release-name-ingress
+  namespace: openstack
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+      - pods
+      - secrets
+      - namespaces
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    resourceNames:
+      - "release-name-nginx"
+    verbs:
+      - get
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - create
+  - apiGroups:
+      - ""
+    resources:
+      - endpoints
+    verbs:
+      - get
+      - create
+      - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: release-name-ingress
+  namespace: openstack
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: release-name-ingress
+subjects:
+  - kind: ServiceAccount
+    name: release-name-ingress
+    namespace: openstack
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingress
+  annotations:
+    "openstackhelm.openstack.org/release_uuid": ""
+  labels:
+    release_group: release-name
+    application: ingress
+    component: server
+    app: ingress-api
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 3
+  selector:
+    matchLabels:
+      release_group: release-name
+      application: ingress
+      component: server
+      app: ingress-api
+  template:
+    metadata:
+      labels:
+        release_group: release-name
+        application: ingress
+        component: server
+        app: ingress-api
+      annotations:
+        "openstackhelm.openstack.org/release_uuid": ""
+        configmap-bin-hash: "71d4cbb3936fd7f0f357da33219af28394eb7bb18e6b7a5002800df27732de8f"
+        configmap-etc-hash: "369dbe44e608890f4d77cbb9c7dd70fe6688196a734ebe3ade647f049c87714b"
+        
+    spec:
+      securityContext:
+        runAsUser: 65534
+        
+      shareProcessNamespace: true
+      serviceAccountName: release-name-ingress
+      affinity:
+        
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: release_group
+                    operator: In
+                    values:
+                    - release-name
+                  - key: application
+                    operator: In
+                    values:
+                    - ingress
+                  - key: component
+                    operator: In
+                    values:
+                    - server
+                  
+              topologyKey: kubernetes.io/hostname
+            weight: 10
+      nodeSelector:
+        openstack-control-plane: "enabled"
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 60
+      initContainers:
+        
+        - name: init
+          image: "quay.io/airshipit/kubernetes-entrypoint:v1.0.0"
+          imagePullPolicy: IfNotPresent  
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65534
+            
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: INTERFACE_NAME
+              value: eth0
+            - name: PATH
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/
+            - name: DEPENDENCY_SERVICE
+              value: ""
+            - name: DEPENDENCY_DAEMONSET
+              value: ""
+            - name: DEPENDENCY_CONTAINER
+              value: ""
+            - name: DEPENDENCY_POD_JSON
+              value: ""
+            - name: DEPENDENCY_CUSTOM_RESOURCE
+              value: ""
+          command:
+            - kubernetes-entrypoint
+          volumeMounts:
+            []
+            
+      containers:
+        - name: ingress
+          image: "quay.io/kubernetes-ingress-controller/nginx-ingress-controller:0.23.0"
+          imagePullPolicy: IfNotPresent
+          
+          
+          securityContext:
+            readOnlyRootFilesystem: false
+            runAsUser: 33
+            
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 10254
+              scheme: HTTP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 10254
+              scheme: HTTP
+            initialDelaySeconds: 10
+            timeoutSeconds: 1
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: PORT_HTTP
+              value: "80"
+            - name: PORT_HTTPS
+              value: "443"
+            - name: PORT_STATUS
+              value: "10246"
+            - name: PORT_STREAM
+              value: "10247"
+            - name: PORT_PROFILER
+              value: "10245"
+            - name: PORT_HEALTHZ
+              value: "10254"
+            - name: DEFAULT_SERVER_PORT
+              value: "8181"
+            - name: RELEASE_NAME
+              value: "release-name"
+            - name: ERROR_PAGE_SERVICE
+              value: "ingress-error-pages"
+            - name: INGRESS_CLASS
+              value: "nginx"
+            
+          ports:
+            - containerPort: 80
+            - containerPort: 443
+            - containerPort: 10246
+            - containerPort: 10254
+            - containerPort: 8181
+          command:
+            - /tmp/ingress-controller.sh
+            - start
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /tmp/ingress-controller.sh
+                  - stop
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: ingress-bin
+              mountPath: /tmp/ingress-controller.sh
+              subPath: ingress-controller.sh
+              readOnly: true
+      volumes:
+        - name: pod-tmp
+          emptyDir: {}
+        - name: ingress-bin
+          configMap:
+            name: ingress-bin
+            defaultMode: 0555

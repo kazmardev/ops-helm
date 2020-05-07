@@ -1,0 +1,35 @@
+---
+# Source: cinder/templates/ingress-api.yaml
+
+---
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: cinder
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    
+spec:
+  rules:
+    - host: cinder
+      http:
+        paths:
+          - path: /
+            backend:
+              serviceName: cinder-api
+              servicePort: c-api
+    - host: cinder.openstack
+      http:
+        paths:
+          - path: /
+            backend:
+              serviceName: cinder-api
+              servicePort: c-api
+    - host: cinder.openstack.svc.cluster.local
+      http:
+        paths:
+          - path: /
+            backend:
+              serviceName: cinder-api
+              servicePort: c-api

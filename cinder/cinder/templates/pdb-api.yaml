@@ -1,0 +1,15 @@
+---
+# Source: cinder/templates/pdb-api.yaml
+
+---
+apiVersion: policy/v1beta1
+kind: PodDisruptionBudget
+metadata:
+  name: cinder-api
+spec:
+  minAvailable: 0
+  selector:
+    matchLabels:
+      release_group: release-name
+      application: cinder
+      component: api

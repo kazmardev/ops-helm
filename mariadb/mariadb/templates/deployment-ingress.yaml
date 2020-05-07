@@ -1,0 +1,309 @@
+---
+# Source: mariadb/templates/deployment-ingress.yaml
+
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: release-name-ingress
+  namespace: openstack
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: release-name-release-name-ingress
+  namespace: openstack
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: release-name-openstack-release-name-ingress
+subjects:
+  - kind: ServiceAccount
+    name: release-name-ingress
+    namespace: openstack
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: release-name-openstack-release-name-ingress
+  namespace: openstack
+rules:
+  - apiGroups:
+      - ""
+      - extensions
+      - batch
+      - apps
+    verbs:
+      - get
+      - list
+    resources:
+      - services
+      - endpoints
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: release-name-ingress
+  namespace: openstack
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - services
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - extensions
+      - networking.k8s.io
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - extensions
+      - networking.k8s.io
+    resources:
+      - ingresses/status
+    verbs:
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+      - endpoints
+      - nodes
+      - pods
+      - secrets
+    verbs:
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+      - pods
+      - secrets
+      - namespaces
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resourceNames:
+      - "release-name-release-name-mariadb-ingress"
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - create
+  - apiGroups:
+      - ""
+    resources:
+      - endpoints
+    verbs:
+      - get
+      - create
+      - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: release-name-ingress
+  namespace: openstack
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: release-name-ingress
+subjects:
+  - kind: ServiceAccount
+    name: release-name-ingress
+    namespace: openstack
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mariadb-ingress
+  annotations:
+    "openstackhelm.openstack.org/release_uuid": ""
+  labels:
+    release_group: release-name
+    application: mariadb
+    component: ingress
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      release_group: release-name
+      application: mariadb
+      component: ingress
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 3
+  template:
+    metadata:
+      labels:
+        release_group: release-name
+        application: mariadb
+        component: ingress
+      annotations:
+        "openstackhelm.openstack.org/release_uuid": ""
+        configmap-bin-hash: "6473abe3dd52faa363a79d4201275a4986d1949949b828a854b4118c87b9edb0"
+        configmap-etc-hash: "e3ec220ca35e56eb1d5d3c20213092a0aab86f40f30436bf03bacc77c46247e6"
+        
+    spec:
+      shareProcessNamespace: true
+      serviceAccountName: release-name-ingress
+      securityContext:
+        runAsUser: 65534
+        
+      affinity:
+        
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: release_group
+                    operator: In
+                    values:
+                    - release-name
+                  - key: application
+                    operator: In
+                    values:
+                    - mariadb
+                  - key: component
+                    operator: In
+                    values:
+                    - ingress
+                  
+              topologyKey: kubernetes.io/hostname
+            weight: 10
+      nodeSelector:
+        openstack-control-plane: enabled
+      terminationGracePeriodSeconds: 60
+      initContainers:
+        
+        - name: init
+          image: "quay.io/airshipit/kubernetes-entrypoint:v1.0.0"
+          imagePullPolicy: IfNotPresent  
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65534
+            
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: INTERFACE_NAME
+              value: eth0
+            - name: PATH
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/
+            - name: DEPENDENCY_SERVICE
+              value: "openstack:mariadb-ingress-error-pages"
+            - name: DEPENDENCY_DAEMONSET
+              value: ""
+            - name: DEPENDENCY_CONTAINER
+              value: ""
+            - name: DEPENDENCY_POD_JSON
+              value: ""
+            - name: DEPENDENCY_CUSTOM_RESOURCE
+              value: ""
+          command:
+            - kubernetes-entrypoint
+          volumeMounts:
+            []
+            
+      containers:
+        - name: ingress
+          image: "quay.io/kubernetes-ingress-controller/nginx-ingress-controller:0.9.0"
+          imagePullPolicy: IfNotPresent
+          
+          securityContext:
+            readOnlyRootFilesystem: false
+            runAsUser: 0
+            
+          
+          readinessProbe:
+            tcpSocket:
+              port: 3306
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 10254
+              scheme: HTTP
+            initialDelaySeconds: 10
+            timeoutSeconds: 1
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RELEASE_NAME
+              value: "release-name"
+            - name: INGRESS_CLASS
+              value: "release-name-mariadb-ingress"
+            - name: ERROR_PAGE_SERVICE
+              value: "mariadb-ingress-error-pages"
+          command:
+            - /tmp/mariadb-ingress-controller.sh
+            - start
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /tmp/mariadb-ingress-controller.sh
+                  - stop
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: mariadb-bin
+              mountPath: /tmp/mariadb-ingress-controller.sh
+              subPath: mariadb-ingress-controller.sh
+              readOnly: true
+            - name: mariadb-ingress-etc
+              mountPath: /etc/nginx/template/nginx.tmpl
+              subPath: nginx.tmpl
+              readOnly: true
+      volumes:
+        - name: pod-tmp
+          emptyDir: {}
+        - name: mariadb-bin
+          configMap:
+            name: mariadb-bin
+            defaultMode: 0555
+        - name: mariadb-ingress-etc
+          configMap:
+            name: mariadb-ingress-etc
+            defaultMode: 0444

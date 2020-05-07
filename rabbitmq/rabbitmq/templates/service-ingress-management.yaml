@@ -1,0 +1,15 @@
+---
+# Source: rabbitmq/templates/service-ingress-management.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: release-name-mgr-90b19a
+spec:
+  ports:
+    - name: http
+      port: 80
+    - name: https
+      port: 443
+  selector:
+    app: ingress-api

@@ -1,0 +1,18 @@
+---
+# Source: cinder/templates/service-api.yaml
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cinder-api
+spec:
+  ports:
+    - name: c-api
+      port: 8776
+    
+  selector:
+    release_group: release-name
+    application: cinder
+    component: api
+  

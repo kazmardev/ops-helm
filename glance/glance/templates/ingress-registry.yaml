@@ -1,0 +1,35 @@
+---
+# Source: glance/templates/ingress-registry.yaml
+
+---
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: glance-reg
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    
+spec:
+  rules:
+    - host: glance-reg
+      http:
+        paths:
+          - path: /
+            backend:
+              serviceName: glance-registry
+              servicePort: g-reg
+    - host: glance-reg.openstack
+      http:
+        paths:
+          - path: /
+            backend:
+              serviceName: glance-registry
+              servicePort: g-reg
+    - host: glance-reg.openstack.svc.cluster.local
+      http:
+        paths:
+          - path: /
+            backend:
+              serviceName: glance-registry
+              servicePort: g-reg

@@ -1,0 +1,13 @@
+---
+# Source: libvirt/templates/configmap-etc.yaml
+
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: libvirt-etc
+type: Opaque
+data:
+  libvirtd.conf: CmF1dGhfdGNwID0gIm5vbmUiCmNhX2ZpbGUgPSAiIgpsaXN0ZW5fYWRkciA9ICIxMjcuMC4wLjEiCmxpc3Rlbl90Y3AgPSAxCmxpc3Rlbl90bHMgPSAwCmxvZ19sZXZlbCA9IDMKbG9nX291dHB1dHMgPSAiMTpmaWxlOi92YXIvbG9nL2xpYnZpcnQvbGlidmlydGQubG9nIg==
+  qemu.conf: Cmdyb3VwID0gImt2bSIKc3RkaW9faGFuZGxlciA9ICJmaWxlIgp1c2VyID0gIm5vdmEi
