@@ -1,0 +1,85 @@
+---
+# Source: horizon/templates/network_policy.yaml
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: horizon-netpol
+  namespace: openstack
+spec:
+  policyTypes:
+    - Egress
+
+    - Ingress
+
+  podSelector:
+    matchLabels:
+      application: horizon
+
+  egress:
+    - to:
+      - podSelector:
+          matchLabels:
+            application: horizon
+      ports:
+      - port: 80
+        protocol: TCP
+    - to:
+      - podSelector:
+          matchLabels:
+            application: keystone
+      ports:
+      - port: 80
+        protocol: TCP
+      - port: 5000
+        protocol: TCP
+    - to:
+      - podSelector:
+          matchLabels:
+            application: ingress
+      ports:
+      - port: 80
+        protocol: TCP
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            name: kube-system
+      ports:
+      - port: 53
+        protocol: UDP
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            name: docker-registry
+      ports:
+      - port: 5000
+        protocol: TCP
+    - to:
+      - podSelector:
+          matchLabels:
+            application: memcached
+      ports:
+      - port: 11211
+        protocol: TCP
+    - to:
+      - podSelector:
+          matchLabels:
+            application: mariadb
+      ports:
+      - port: 3306
+        protocol: TCP
+    - {}
+    
+  ingress:
+    - {}
+    
