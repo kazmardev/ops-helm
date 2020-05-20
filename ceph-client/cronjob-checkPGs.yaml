@@ -1,0 +1,220 @@
+---
+# Source: ceph-client/templates/cronjob-checkPGs.yaml
+
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ceph-pool-checkpgs
+  namespace: ceph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: release-name-ceph-pool-checkpgs
+  namespace: ceph
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: release-name-ceph-ceph-pool-checkpgs
+subjects:
+  - kind: ServiceAccount
+    name: ceph-pool-checkpgs
+    namespace: ceph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: release-name-ceph-ceph-pool-checkpgs
+  namespace: ceph
+rules:
+  - apiGroups:
+      - ""
+      - extensions
+      - batch
+      - apps
+    verbs:
+      - get
+      - list
+    resources:
+      - services
+      - endpoints
+      - jobs
+      - pods
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ceph-pool-checkpgs
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+      - pods/exec
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ceph-pool-checkpgs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ceph-pool-checkpgs
+subjects:
+  - kind: ServiceAccount
+    name: ceph-pool-checkpgs
+    namespace: ceph
+---
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: ceph-pool-checkpgs
+  annotations:
+    "openstackhelm.openstack.org/release_uuid": ""
+spec:
+  schedule: "*/15 * * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 60
+  jobTemplate:
+    metadata:
+      labels:
+        release_group: release-name
+        application: ceph
+        component: pool-checkpgs
+    spec:
+      template:
+        metadata:
+          labels:
+            release_group: release-name
+            application: ceph
+            component: pool-checkpgs
+        spec:
+          serviceAccountName: ceph-pool-checkpgs
+          nodeSelector:
+            ceph-mgr: enabled
+          initContainers:
+            
+            - name: init
+              image: "quay.io/airshipit/kubernetes-entrypoint:v1.0.0"
+              imagePullPolicy: IfNotPresent  
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                runAsUser: 65534
+                
+              env:
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      apiVersion: v1
+                      fieldPath: metadata.name
+                - name: NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      apiVersion: v1
+                      fieldPath: metadata.namespace
+                - name: INTERFACE_NAME
+                  value: eth0
+                - name: PATH
+                  value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/
+                - name: DEPENDENCY_SERVICE
+                  value: "ceph:ceph-mgr"
+                - name: DEPENDENCY_JOBS
+                  value: "ceph-rbd-pool"
+                - name: DEPENDENCY_DAEMONSET
+                  value: ""
+                - name: DEPENDENCY_CONTAINER
+                  value: ""
+                - name: DEPENDENCY_POD_JSON
+                  value: ""
+                - name: DEPENDENCY_CUSTOM_RESOURCE
+                  value: ""
+              command:
+                - kubernetes-entrypoint
+              volumeMounts:
+                []
+                
+          containers:
+          - name: ceph-pool-checkpgs
+            image: "docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200416"
+            imagePullPolicy: IfNotPresent
+            env:
+              - name: DEPLOYMENT_NAMESPACE
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.namespace
+            command:
+              - /tmp/utils-checkPGs.sh
+            volumeMounts:
+              - name: pod-tmp
+                mountPath: /tmp
+              - name: pod-etc-ceph
+                mountPath: /etc/ceph
+              - name: ceph-client-bin
+                mountPath: /tmp/utils-checkPGs.py
+                subPath: utils-checkPGs.py
+                readOnly: true
+              - name: ceph-client-bin
+                mountPath: /tmp/utils-checkPGs.sh
+                subPath: utils-checkPGs.sh
+                readOnly: true
+              - name: ceph-client-etc
+                mountPath: /etc/ceph/ceph.conf
+                subPath: ceph.conf
+                readOnly: true
+              - mountPath: /etc/ceph/ceph.client.admin.keyring
+                name: ceph-client-admin-keyring
+                readOnly: true
+                subPath: ceph.client.admin.keyring
+              - mountPath: /etc/ceph/ceph.mon.keyring.seed
+                name: ceph-mon-keyring
+                readOnly: true
+                subPath: ceph.mon.keyring
+              - mountPath: /var/lib/ceph/bootstrap-osd/ceph.keyring
+                name: ceph-bootstrap-osd-keyring
+                readOnly: true
+                subPath: ceph.keyring
+              - mountPath: /var/lib/ceph/bootstrap-mds/ceph.keyring
+                name: ceph-bootstrap-mds-keyring
+                readOnly: true
+                subPath: ceph.keyring
+          restartPolicy: Never
+          hostNetwork: true
+          volumes:
+            - name: pod-tmp
+              emptyDir: {}
+            - name: pod-etc-ceph
+              emptyDir: {}
+            - name: ceph-client-bin
+              configMap:
+                name: ceph-client-bin
+                defaultMode: 0555
+            - name: ceph-client-etc
+              configMap:
+                name: ceph-client-etc
+                defaultMode: 0444
+            - name: ceph-client-admin-keyring
+              secret:
+                defaultMode: 420
+                secretName: ceph-client-admin-keyring
+            - name: ceph-mon-keyring
+              secret:
+                defaultMode: 420
+                secretName: ceph-mon-keyring
+            - name: ceph-bootstrap-osd-keyring
+              secret:
+                defaultMode: 420
+                secretName: ceph-bootstrap-osd-keyring
+            - name: ceph-bootstrap-mds-keyring
+              secret:
+                defaultMode: 420
+                secretName: ceph-bootstrap-mds-keyring

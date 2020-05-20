@@ -1,0 +1,1089 @@
+---
+# Source: ceph-client/templates/configmap-bin.yaml
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ceph-client-bin
+data:
+  bootstrap.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    ceph -s
+    function ensure_pool () {
+      ceph osd pool stats $1 || ceph osd pool create $1 $2
+      local test_version=$(ceph tell osd.* version | egrep -c "nautilus|mimic|luminous" | xargs echo)
+      if [[ ${test_version} -gt 0 ]]; then
+        ceph osd pool application enable $1 $3
+      fi
+    }
+    #ensure_pool volumes 8 cinder
+    
+    
+
+  init-dirs.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    export LC_ALL=C
+    : "${HOSTNAME:=$(uname -n)}"
+    : "${MGR_NAME:=${HOSTNAME}}"
+    : "${MDS_NAME:=mds-${HOSTNAME}}"
+    : "${MDS_BOOTSTRAP_KEYRING:=/var/lib/ceph/bootstrap-mds/${CLUSTER}.keyring}"
+    : "${OSD_BOOTSTRAP_KEYRING:=/var/lib/ceph/bootstrap-osd/${CLUSTER}.keyring}"
+    
+    for keyring in ${OSD_BOOTSTRAP_KEYRING} ${MDS_BOOTSTRAP_KEYRING}; do
+      mkdir -p "$(dirname "$keyring")"
+    done
+    
+    # Let's create the ceph directories
+    for DIRECTORY in mds tmp mgr; do
+      mkdir -p "/var/lib/ceph/${DIRECTORY}"
+    done
+    
+    # Create socket directory
+    mkdir -p /run/ceph
+    
+    # Create the MDS directory
+    mkdir -p "/var/lib/ceph/mds/${CLUSTER}-${MDS_NAME}"
+    
+    # Create the MGR directory
+    mkdir -p "/var/lib/ceph/mgr/${CLUSTER}-${MGR_NAME}"
+    
+    # Adjust the owner of all those directories
+    chown -R ceph. /run/ceph/ /var/lib/ceph/*
+    
+
+  pool-init.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    export LC_ALL=C
+    
+    : "${ADMIN_KEYRING:=/etc/ceph/${CLUSTER}.client.admin.keyring}"
+    
+    if [[ ! -e /etc/ceph/${CLUSTER}.conf ]]; then
+      echo "ERROR- /etc/ceph/${CLUSTER}.conf must exist; get it from your existing mon"
+      exit 1
+    fi
+    
+    if [[ ! -e ${ADMIN_KEYRING} ]]; then
+       echo "ERROR- ${ADMIN_KEYRING} must exist; get it from your existing mon"
+       exit 1
+    fi
+    
+    function wait_for_inactive_pgs () {
+      echo "#### Start: Checking for inactive pgs ####"
+    
+      # Loop until all pgs are active
+      if [[ $(ceph tell mon.* version | egrep -q "nautilus"; echo $?) -eq 0 ]]; then
+        while [[ `ceph --cluster ${CLUSTER} pg ls | tail -n +2 | head -n -2 | grep -v "active+"` ]]
+        do
+          sleep 3
+        done
+      else
+        while [[ `ceph --cluster ${CLUSTER} pg ls | tail -n +2 | grep -v "active+"` ]]
+        do
+          sleep 3
+        done
+      fi
+    }
+    
+    function create_crushrule () {
+      CRUSH_NAME=$1
+      CRUSH_RULE=$2
+      CRUSH_FAILURE_DOMAIN=$3
+      CRUSH_DEVICE_CLASS=$4
+      if ! ceph --cluster "${CLUSTER}" osd crush rule ls | grep -q "^\$CRUSH_NAME$"; then
+        ceph --cluster "${CLUSTER}" osd crush rule $CRUSH_RULE $CRUSH_NAME default $CRUSH_FAILURE_DOMAIN $CRUSH_DEVICE_CLASS || true
+      fi
+    }
+    
+    # Set mons to use the msgr2 protocol on nautilus
+    if [[ -z "$(ceph mon versions | grep ceph\ version | grep -v nautilus)" ]]; then
+      ceph --cluster "${CLUSTER}" mon enable-msgr2
+    fi
+    create_crushrule same_host create-simple osd 
+    create_crushrule replicated_rule create-simple host 
+    create_crushrule rack_replicated_rule create-simple rack 
+    
+    function reweight_osds () {
+      for OSD_ID in $(ceph --cluster "${CLUSTER}" osd df | awk '$3 == "0" {print $1}'); do
+        OSD_WEIGHT=$(ceph --cluster "${CLUSTER}" osd df --format json-pretty| grep -A7 "\bosd.${OSD_ID}\b" | awk '/"kb"/{ gsub(",",""); d= $2/1073741824 ; r = sprintf("%.2f", d); print r }');
+        ceph --cluster "${CLUSTER}" osd crush reweight osd.${OSD_ID} ${OSD_WEIGHT};
+      done
+    }
+    
+    function enable_autoscaling () {
+      if [[ "${ENABLE_AUTOSCALER}" == "true" ]]; then
+        ceph mgr module enable pg_autoscaler
+        ceph config set global osd_pool_default_pg_autoscale_mode on
+      fi
+    }
+    
+    function create_pool () {
+      POOL_APPLICATION=$1
+      POOL_NAME=$2
+      POOL_REPLICATION=$3
+      POOL_PLACEMENT_GROUPS=$4
+      POOL_CRUSH_RULE=$5
+      POOL_PROTECTION=$6
+      if ! ceph --cluster "${CLUSTER}" osd pool stats "${POOL_NAME}" > /dev/null 2>&1; then
+        ceph --cluster "${CLUSTER}" osd pool create "${POOL_NAME}" ${POOL_PLACEMENT_GROUPS}
+        while [ $(ceph --cluster "${CLUSTER}" -s | grep creating -c) -gt 0 ]; do echo -n .;sleep 1; done
+        ceph --cluster "${CLUSTER}" osd pool application enable "${POOL_NAME}" "${POOL_APPLICATION}"
+      else
+        if [[ -z "$(ceph osd versions | grep ceph\ version | grep -v nautilus)" ]] && [[ $"{ENABLE_AUTOSCALER}" == "true" ]] ; then
+          ceph --cluster "${CLUSTER}" osd pool set "${POOL_NAME}" pg_autoscale_mode on
+        fi
+      fi
+    #
+    # Make sure pool is not protected after creation AND expansion so we can manipulate its settings.
+    # Final protection settings are applied once parameters (size, pg) have been adjusted.
+    #
+      ceph --cluster "${CLUSTER}" osd pool set "${POOL_NAME}" nosizechange false
+      ceph --cluster "${CLUSTER}" osd pool set "${POOL_NAME}" nopgchange false
+      ceph --cluster "${CLUSTER}" osd pool set "${POOL_NAME}" nodelete false
+    #
+      ceph --cluster "${CLUSTER}" osd pool set "${POOL_NAME}" size ${POOL_REPLICATION}
+      ceph --cluster "${CLUSTER}" osd pool set "${POOL_NAME}" crush_rule "${POOL_CRUSH_RULE}"
+    # set pg_num to pool
+      if [[ -z "$(ceph osd versions | grep ceph\ version | grep -v nautilus)" ]]; then
+        ceph --cluster "${CLUSTER}" osd pool set "${POOL_NAME}" "pg_num" "${POOL_PLACEMENT_GROUPS}"
+      else
+        for PG_PARAM in pg_num pgp_num; do
+          CURRENT_PG_VALUE=$(ceph --cluster "${CLUSTER}" osd pool get "${POOL_NAME}" "${PG_PARAM}" | awk "/^${PG_PARAM}:/ { print \$NF }")
+          if [ "${POOL_PLACEMENT_GROUPS}" -gt "${CURRENT_PG_VALUE}" ]; then
+            ceph --cluster "${CLUSTER}" osd pool set "${POOL_NAME}" "${PG_PARAM}" "${POOL_PLACEMENT_GROUPS}"
+          fi
+        done
+      fi
+    
+    #This is to handle cluster expansion case where replication may change from intilization
+      if [ ${POOL_REPLICATION} -gt 1 ]; then
+        EXPECTED_POOLMINSIZE=$[${POOL_REPLICATION}-1]
+        ceph --cluster "${CLUSTER}" osd pool set "${POOL_NAME}" min_size ${EXPECTED_POOLMINSIZE}
+      fi
+    #
+    # Handling of .Values.conf.pool.target.protected:
+    # Possible settings
+    # - true  | 1 = Protect the pools after they get created
+    # - false | 0 = Do not protect the pools once they get created and let Ceph defaults apply
+    # - Absent    = Do not protect the pools once they get created and let Ceph defaults apply
+    #
+    # If protection is not requested through values.yaml, just use the Ceph defaults. With Luminous we do not
+    # apply any protection to the pools when they get created.
+    #
+    # Note: If the /etc/ceph/ceph.conf file modifies the defaults the deployment will fail on pool creation
+    # - nosizechange = Do not allow size and min_size changes on the pool
+    # - nodelete     = Do not allow deletion of the pool
+    #
+      if [ "x${POOL_PROTECTION}" == "xtrue" ] ||  [ "x${POOL_PROTECTION}" == "x1" ]; then
+        ceph --cluster "${CLUSTER}" osd pool set "${POOL_NAME}" nosizechange true
+        ceph --cluster "${CLUSTER}" osd pool set "${POOL_NAME}" nodelete true
+      fi
+    }
+    
+    function manage_pool () {
+      POOL_APPLICATION=$1
+      POOL_NAME=$2
+      POOL_REPLICATION=$3
+      TOTAL_DATA_PERCENT=$4
+      TARGET_PG_PER_OSD=$5
+      POOL_CRUSH_RULE=$6
+      TARGET_QUOTA=$7
+      POOL_PROTECTION=$8
+      CLUSTER_CAPACITY=$9
+      TOTAL_OSDS=8
+      POOL_PLACEMENT_GROUPS=$(/tmp/pool-calc.py ${POOL_REPLICATION} ${TOTAL_OSDS} ${TOTAL_DATA_PERCENT} ${TARGET_PG_PER_OSD})
+      create_pool "${POOL_APPLICATION}" "${POOL_NAME}" "${POOL_REPLICATION}" "${POOL_PLACEMENT_GROUPS}" "${POOL_CRUSH_RULE}" "${POOL_PROTECTION}"
+      POOL_REPLICAS=$(ceph --cluster "${CLUSTER}" osd pool get "${POOL_NAME}" size | awk '{print $2}')
+      POOL_QUOTA=$(python -c "print(int($CLUSTER_CAPACITY * $TOTAL_DATA_PERCENT * $TARGET_QUOTA / $POOL_REPLICAS / 100 / 100))")
+      ceph --cluster "${CLUSTER}" osd pool set-quota "${POOL_NAME}" max_bytes $POOL_QUOTA
+    }
+    
+    reweight_osds
+    
+    
+    
+    
+    
+    cluster_capacity=0
+    if [[ -z "$(ceph osd versions | grep ceph\ version | grep -v nautilus)" ]]; then
+      cluster_capacity=$(ceph --cluster "${CLUSTER}" df | grep "TOTAL" | awk '{print $2 substr($3, 1, 1)}' | numfmt --from=iec)
+      enable_autoscaling
+    else
+      cluster_capacity=$(ceph --cluster "${CLUSTER}" df | head -n3 | tail -n1 | awk '{print $1 substr($2, 1, 1)}' | numfmt --from=iec)
+    fi
+    manage_pool rbd rbd 3 40 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool cephfs cephfs_metadata 3 5 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool cephfs cephfs_data 3 10 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool rgw .rgw.root 3 0.1 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool rgw default.rgw.control 3 0.1 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool rgw default.rgw.data.root 3 0.1 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool rgw default.rgw.gc 3 0.1 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool rgw default.rgw.log 3 0.1 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool rgw default.rgw.intent-log 3 0.1 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool rgw default.rgw.meta 3 0.1 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool rgw default.rgw.usage 3 0.1 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool rgw default.rgw.users.keys 3 0.1 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool rgw default.rgw.users.email 3 0.1 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool rgw default.rgw.users.swift 3 0.1 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool rgw default.rgw.users.uid 3 0.1 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool rgw default.rgw.buckets.extra 3 0.1 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool rgw default.rgw.buckets.index 3 3 100 replicated_rule 100 "true" ${cluster_capacity}
+    manage_pool rgw default.rgw.buckets.data 3 34.8 100 replicated_rule 100 "true" ${cluster_capacity}
+    ceph --cluster "${CLUSTER}" osd crush tunables hammer
+    
+    wait_for_inactive_pgs
+    
+  pool-calc.py: |
+    #!/usr/bin/python
+    # -*- coding: utf-8 -*-
+    
+    
+    
+    #NOTE(portdirect): this is a simple approximation of https://ceph.com/pgcalc/
+    
+    import math
+    import sys
+    
+    replication = int(sys.argv[1])
+    number_of_osds = int(sys.argv[2])
+    percentage_data = float(sys.argv[3])
+    target_pgs_per_osd = int(sys.argv[4])
+    
+    raw_pg_num_opt = target_pgs_per_osd * number_of_osds \
+        * (math.ceil(percentage_data) / 100.0) / replication
+    
+    raw_pg_num_min = number_of_osds / replication
+    
+    if raw_pg_num_min >= raw_pg_num_opt:
+        raw_pg_num = raw_pg_num_min
+    else:
+        raw_pg_num = raw_pg_num_opt
+    
+    max_pg_num = int(math.pow(2, math.ceil(math.log(raw_pg_num, 2))))
+    min_pg_num = int(math.pow(2, math.floor(math.log(raw_pg_num, 2))))
+    
+    if min_pg_num >= (raw_pg_num * 0.75):
+        print(min_pg_num)
+    else:
+        print(max_pg_num)
+    
+
+  mds-start.sh: |
+    #!/bin/bash
+    set -ex
+    export LC_ALL=C
+    : "${HOSTNAME:=$(uname -n)}"
+    : "${CEPHFS_CREATE:=0}"
+    : "${CEPHFS_NAME:=cephfs}"
+    : "${CEPHFS_DATA_POOL:=${CEPHFS_NAME}_data}"
+    : "${CEPHFS_DATA_POOL_PG:=8}"
+    : "${CEPHFS_METADATA_POOL:=${CEPHFS_NAME}_metadata}"
+    : "${CEPHFS_METADATA_POOL_PG:=8}"
+    : "${MDS_NAME:=mds-${HOSTNAME}}"
+    : "${ADMIN_KEYRING:=/etc/ceph/${CLUSTER}.client.admin.keyring}"
+    : "${MDS_KEYRING:=/var/lib/ceph/mds/${CLUSTER}-${MDS_NAME}/keyring}"
+    : "${MDS_BOOTSTRAP_KEYRING:=/var/lib/ceph/bootstrap-mds/${CLUSTER}.keyring}"
+    : "${CEPH_CONF:="/etc/ceph/${CLUSTER}.conf"}"
+    
+    if [[ ! -e ${CEPH_CONF}.template ]]; then
+      echo "ERROR- ${CEPH_CONF}.template must exist; get it from your existing mon"
+      exit 1
+    else
+      ENDPOINT=$(kubectl get endpoints ceph-mon-discovery -n ${NAMESPACE} -o json | awk -F'"' -v port=${MON_PORT} \
+                 -v version=v1 -v msgr_version=v2 \
+                 -v msgr2_port=${MON_PORT_V2} \
+                 '/"ip"/{print "["version":"$4":"port"/"0","msgr_version":"$4":"msgr2_port"/"0"]"}' | paste -sd',')
+      if [[ "${ENDPOINT}" == "" ]]; then
+        /bin/sh -c -e "cat ${CEPH_CONF}.template | tee ${CEPH_CONF}" || true
+      else
+        /bin/sh -c -e "cat ${CEPH_CONF}.template | sed 's#mon_host.*#mon_host = ${ENDPOINT}#g' | tee ${CEPH_CONF}" || true
+      fi
+    fi
+    
+    # Check to see if we are a new MDS
+    if [ ! -e "${MDS_KEYRING}" ]; then
+    
+      if [ -e "${ADMIN_KEYRING}" ]; then
+         KEYRING_OPT=(--name client.admin --keyring "${ADMIN_KEYRING}")
+      elif [ -e "${MDS_BOOTSTRAP_KEYRING}" ]; then
+         KEYRING_OPT=(--name client.bootstrap-mds --keyring "${MDS_BOOTSTRAP_KEYRING}")
+      else
+        echo "ERROR- Failed to bootstrap MDS: could not find admin or bootstrap-mds keyring.  You can extract it from your current monitor by running 'ceph auth get client.bootstrap-mds -o ${MDS_BOOTSTRAP_KEYRING}"
+        exit 1
+      fi
+    
+      timeout 10 ceph --cluster "${CLUSTER}" "${KEYRING_OPT[@]}" health || exit 1
+    
+      # Generate the MDS key
+      ceph --cluster "${CLUSTER}" "${KEYRING_OPT[@]}" auth get-or-create "mds.${MDS_NAME}" osd 'allow rwx' mds 'allow' mon 'allow profile mds' -o "${MDS_KEYRING}"
+      chown ceph. "${MDS_KEYRING}"
+      chmod 600 "${MDS_KEYRING}"
+    
+    fi
+    
+    # NOTE (leseb): having the admin keyring is really a security issue
+    # If we need to bootstrap a MDS we should probably create the following on the monitors
+    # I understand that this handy to do this here
+    # but having the admin key inside every container is a concern
+    
+    # Create the Ceph filesystem, if necessary
+    if [ $CEPHFS_CREATE -eq 1 ]; then
+    
+      if [[ ! -e ${ADMIN_KEYRING} ]]; then
+          echo "ERROR- ${ADMIN_KEYRING} must exist; get it from your existing mon"
+          exit 1
+      fi
+    
+      if [[ "$(ceph --cluster "${CLUSTER}" fs ls | grep -c name:.${CEPHFS_NAME},)" -eq 0 ]]; then
+         # Make sure the specified data pool exists
+         if ! ceph --cluster "${CLUSTER}" osd pool stats ${CEPHFS_DATA_POOL} > /dev/null 2>&1; then
+            ceph --cluster "${CLUSTER}" osd pool create ${CEPHFS_DATA_POOL} ${CEPHFS_DATA_POOL_PG}
+         fi
+    
+         # Make sure the specified metadata pool exists
+         if ! ceph --cluster "${CLUSTER}" osd pool stats ${CEPHFS_METADATA_POOL} > /dev/null 2>&1; then
+            ceph --cluster "${CLUSTER}" osd pool create ${CEPHFS_METADATA_POOL} ${CEPHFS_METADATA_POOL_PG}
+         fi
+    
+         ceph --cluster "${CLUSTER}" fs new ${CEPHFS_NAME} ${CEPHFS_METADATA_POOL} ${CEPHFS_DATA_POOL}
+      fi
+    fi
+    
+    # NOTE: prefixing this with exec causes it to die (commit suicide)
+    /usr/bin/ceph-mds \
+      --cluster "${CLUSTER}" \
+      --setuser "ceph" \
+      --setgroup "ceph" \
+      -d \
+      -i "${MDS_NAME}"
+    
+
+  mgr-start.sh: |
+    #!/bin/bash
+    set -ex
+    : "${CEPH_GET_ADMIN_KEY:=0}"
+    : "${MGR_NAME:=$(uname -n)}"
+    : "${MGR_KEYRING:=/var/lib/ceph/mgr/${CLUSTER}-${MGR_NAME}/keyring}"
+    : "${ADMIN_KEYRING:=/etc/ceph/${CLUSTER}.client.admin.keyring}"
+    : "${CEPH_CONF:="/etc/ceph/${CLUSTER}.conf"}"
+    
+    if [[ ! -e ${CEPH_CONF}.template ]]; then
+      echo "ERROR- ${CEPH_CONF}.template must exist; get it from your existing mon"
+      exit 1
+    else
+      ENDPOINT=$(kubectl get endpoints ceph-mon-discovery -n ${NAMESPACE} -o json | awk -F'"' -v port=${MON_PORT} \
+                 -v version=v1 -v msgr_version=v2 \
+                 -v msgr2_port=${MON_PORT_V2} \
+                 '/"ip"/{print "["version":"$4":"port"/"0","msgr_version":"$4":"msgr2_port"/"0"]"}' | paste -sd',')
+      if [[ "${ENDPOINT}" == "" ]]; then
+        /bin/sh -c -e "cat ${CEPH_CONF}.template | tee ${CEPH_CONF}" || true
+      else
+        /bin/sh -c -e "cat ${CEPH_CONF}.template | sed 's#mon_host.*#mon_host = ${ENDPOINT}#g' | tee ${CEPH_CONF}" || true
+      fi
+    fi
+    
+    if [ ${CEPH_GET_ADMIN_KEY} -eq 1 ]; then
+        if [[ ! -e ${ADMIN_KEYRING} ]]; then
+            echo "ERROR- ${ADMIN_KEYRING} must exist; get it from your existing mon"
+            exit 1
+        fi
+    fi
+    
+    # Create a MGR keyring
+    rm -rf $MGR_KEYRING
+    if [ ! -e "$MGR_KEYRING" ]; then
+        # Create ceph-mgr key
+        timeout 10 ceph --cluster "${CLUSTER}" auth get-or-create mgr."${MGR_NAME}" mon 'allow profile mgr' osd 'allow *' mds 'allow *' -o "$MGR_KEYRING"
+        chown --verbose ceph. "$MGR_KEYRING"
+        chmod 600 "$MGR_KEYRING"
+    fi
+    
+    echo "SUCCESS"
+    
+    ceph --cluster "${CLUSTER}" -v
+    
+    # Env. variables matching the pattern "<module>_" will be
+    # found and parsed for config-key settings by
+    #  ceph config set mgr mgr/<module>/<key> <value>
+    MODULES_TO_DISABLE=`ceph mgr dump | python -c "import json, sys; print(' '.join(json.load(sys.stdin)['modules']))"`
+    
+    for module in ${ENABLED_MODULES}; do
+        # This module may have been enabled in the past
+        # remove it from the disable list if present
+        MODULES_TO_DISABLE=${MODULES_TO_DISABLE/$module/}
+    
+        options=`env | grep ^${module}_ || true`
+        for option in ${options}; do
+            #strip module name
+            option=${option/${module}_/}
+            key=`echo $option | cut -d= -f1`
+            value=`echo $option | cut -d= -f2`
+            if [[ $(ceph tell mon.* version | egrep -q "nautilus"; echo $?) -eq 0 ]]; then
+              ceph --cluster "${CLUSTER}" config set mgr mgr/$module/$key $value --force
+            else
+              ceph --cluster "${CLUSTER}" config set mgr mgr/$module/$key $value
+            fi
+        done
+        ceph --cluster "${CLUSTER}" mgr module enable ${module} --force
+    done
+    
+    for module in $MODULES_TO_DISABLE; do
+      ceph --cluster "${CLUSTER}" mgr module disable ${module}
+    done
+    
+    echo "SUCCESS"
+    # start ceph-mgr
+    exec /usr/bin/ceph-mgr \
+      --cluster "${CLUSTER}" \
+      --setuser "ceph" \
+      --setgroup "ceph" \
+      -d \
+      -i "${MGR_NAME}"
+    
+  mgr-check.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    export LC_ALL=C
+    
+    COMMAND="${@:-liveness}"
+    
+    function heath_check () {
+       ASOK=$(ls /var/run/ceph/${CLUSTER}-mgr*)
+       MGR_NAME=$(basename ${ASOK} | sed -e 's/.asok//' | cut -f 1 -d '.' --complement)
+       MGR_STATE=$(ceph --cluster ${CLUSTER} --connect-timeout 1 daemon mgr.${MGR_NAME} status|grep "osd_epoch")
+       if [ $? = 0 ]; then
+         exit 0
+       else
+         echo $MGR_STATE
+         exit 1
+       fi
+    }
+    
+    function liveness () {
+      heath_check
+    }
+    
+    function readiness () {
+      heath_check
+    }
+    
+    $COMMAND
+    
+
+  helm-tests.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    function check_cluster_status() {
+      echo "#### Start: Checking Ceph cluster status ####"
+      ceph_status_output=$(ceph -s -f json | jq -r '.health')
+      ceph_health_status=$(echo $ceph_status_output | jq -r '.status')
+    
+      if [ "x${ceph_health_status}" == "xHEALTH_OK" ]; then
+        echo "Ceph status is HEALTH_OK"
+      else
+        echo "Ceph cluster status is NOT HEALTH_OK."
+      fi
+    }
+    
+    function check_osd_count() {
+      echo "#### Start: Checking OSD count ####"
+      num_osd=$(ceph osd stat | tr ' ' '\n' | grep -x -E '[0-9]+' | head -n1)
+      num_in_osds=$(ceph osd stat | tr ' ' '\n' | grep -x -E '[0-9]+' | tail -n1)
+      num_up_osds=$(ceph osd stat | tr ' ' '\n' | grep -x -E '[0-9]+' | head -n2 | tail -n1)
+      if [ $EXPECTED_OSDS == 1 ]; then
+        MIN_EXPECTED_OSDS=$EXPECTED_OSDS
+      else
+        MIN_EXPECTED_OSDS=$(($EXPECTED_OSDS*$REQUIRED_PERCENT_OF_OSDS/100))
+      fi
+    
+      if [ "${num_osd}" -eq 0 ]; then
+        echo "There are no osds in the cluster"
+        exit 1
+      elif [ "${num_in_osds}" -ge "${MIN_EXPECTED_OSDS}" ] && [ "${num_up_osds}" -ge "${MIN_EXPECTED_OSDS}"  ]; then
+        echo "Required number of OSDs (${MIN_EXPECTED_OSDS}) are UP and IN status"
+      else
+        echo "Required number of OSDs (${MIN_EXPECTED_OSDS}) are NOT UP and IN status. Cluster shows OSD count=${num_osd}, UP=${num_up_osds}, IN=${num_in_osds}"
+        exit 1
+      fi
+    }
+    
+    function check_failure_domain_count_per_pool() {
+      echo "#### Start: Checking failure domain count per pool ####"
+      pools=$(ceph osd pool ls)
+      for pool in ${pools}
+      do
+        crush_rule=$(ceph osd pool get ${pool} crush_rule | awk '{print $2}')
+        bucket_type=$(ceph osd crush rule dump ${crush_rule} | grep '"type":' | awk -F'"' 'NR==2 {print $4}')
+        num_failure_domains=$(ceph osd tree | grep ${bucket_type} | wc -l)
+        pool_replica_size=$(ceph osd pool get ${pool} size | awk '{print $2}')
+        if [[ ${num_failure_domains} -ge ${pool_replica_size} ]]; then
+          echo "--> Info: Pool ${pool} is configured with enough failure domains ${num_failure_domains} to satisfy pool replica size ${pool_replica_size}"
+        else
+          echo "--> Error : Pool ${pool} is NOT configured with enough failure domains ${num_failure_domains} to satisfy pool replica size ${pool_replica_size}"
+          exit 1
+        fi
+      done
+    }
+    
+    function mgr_validation() {
+      echo "#### Start: MGR validation ####"
+      mgr_dump=$(ceph mgr dump -f json-pretty)
+      echo "Checking for ${MGR_COUNT} MGRs"
+    
+      mgr_avl=$(echo ${mgr_dump} | jq -r '.["available"]')
+    
+      if [ "x${mgr_avl}" == "xtrue" ]; then
+        mgr_active=$(echo ${mgr_dump} | jq -r '.["active_name"]')
+        echo "Out of ${MGR_COUNT}, 1 MGR is active"
+    
+        # Now lets check for standby managers
+        mgr_stdby_count=$(echo ${mgr_dump} | jq -r '.["standbys"]' | jq length)
+    
+        #Total MGR Count - 1 Active = Expected MGRs
+        expected_standbys=$(( MGR_COUNT -1 ))
+    
+        if [ $mgr_stdby_count -eq $expected_standbys ]
+        then
+          echo "Cluster has 1 Active MGR, $mgr_stdby_count Standbys MGR"
+        else
+          echo "Cluster Standbys MGR: Expected count= $expected_standbys Available=$mgr_stdby_count"
+          retcode=1
+        fi
+    
+      else
+        echo "No Active Manager found, Expected 1 MGR to be active out of ${MGR_COUNT}"
+        retcode=1
+      fi
+    
+      if [ "x${retcode}" == "x1" ]
+      then
+        exit 1
+      fi
+    }
+    
+    function pool_validation() {
+    
+      echo "#### Start: Checking Ceph pools ####"
+    
+      echo "From env variables, RBD pool replication count is: ${RBD}"
+    
+      # Assuming all pools have same replication count as RBD
+      # If RBD replication count is greater then 1, POOLMINSIZE should be 1 less then replication count
+      # If RBD replication count is not greate then 1, then POOLMINSIZE should be 1
+    
+      if [ ${RBD} -gt 1 ]; then
+        EXPECTED_POOLMINSIZE=$[${RBD}-1]
+      else
+        EXPECTED_POOLMINSIZE=1
+      fi
+    
+      echo "EXPECTED_POOLMINSIZE: ${EXPECTED_POOLMINSIZE}"
+    
+      expectedCrushRuleId=""
+      nrules=$(echo ${OSD_CRUSH_RULE_DUMP} | jq length)
+      c=$[nrules-1]
+      for n in $(seq 0 ${c})
+      do
+        osd_crush_rule_obj=$(echo ${OSD_CRUSH_RULE_DUMP} | jq -r .[${n}])
+    
+        name=$(echo ${osd_crush_rule_obj} | jq -r .rule_name)
+        echo "Expected Crushrule: ${EXPECTED_CRUSHRULE}, Pool Crushmap: ${name}"
+    
+        if [ "x${EXPECTED_CRUSHRULE}" == "x${name}" ]; then
+          expectedCrushRuleId=$(echo ${osd_crush_rule_obj} | jq .rule_id)
+          echo "Checking against rule: id: ${expectedCrushRuleId}, name:${name}"
+        else
+          echo "Didn't match"
+        fi
+      done
+      echo "Checking cluster for size:${RBD}, min_size:${EXPECTED_POOLMINSIZE}, crush_rule:${EXPECTED_CRUSHRULE}, crush_rule_id:${expectedCrushRuleId}"
+    
+      npools=$(echo ${OSD_POOLS_DETAILS} | jq length)
+      i=$[npools - 1]
+      for n in $(seq 0 ${i})
+      do
+        pool_obj=$(echo ${OSD_POOLS_DETAILS} | jq -r ".[${n}]")
+    
+        size=$(echo ${pool_obj} | jq -r .size)
+        min_size=$(echo ${pool_obj} | jq -r .min_size)
+        pg_num=$(echo ${pool_obj} | jq -r .pg_num)
+        pg_placement_num=$(echo ${pool_obj} | jq -r .pg_placement_num)
+        crush_rule=$(echo ${pool_obj} | jq -r .crush_rule)
+        name=$(echo ${pool_obj} | jq -r .pool_name)
+        pg_autoscale_mode=$(echo ${pool_obj} | jq -r .pg_autoscale_mode)
+        if [[ "${ENABLE_AUTOSCALER}" == "true" ]]; then
+          if [[ "${pg_autoscale_mode}" != "on" ]]; then
+            echo "pg autoscaler not enabled on ${name} pool"
+            exit 1
+          fi
+        fi
+        if [[ $(ceph tell mon.* version | egrep -q "nautilus"; echo $?) -eq 0 ]]; then
+          if [ "x${size}" != "x${RBD}" ] || [ "x${min_size}" != "x${EXPECTED_POOLMINSIZE}" ] \
+            || [ "x${crush_rule}" != "x${expectedCrushRuleId}" ]; then
+            echo "Pool ${name} has incorrect parameters!!! Size=${size}, Min_Size=${min_size}, Rule=${crush_rule}, PG_Autoscale_Mode=${pg_autoscale_mode}"
+            exit 1
+          else
+            echo "Pool ${name} seems configured properly. Size=${size}, Min_Size=${min_size}, Rule=${crush_rule}, PG_Autoscale_Mode=${pg_autoscale_mode}"
+          fi
+        else
+          if [ "x${size}" != "x${RBD}" ] || [ "x${min_size}" != "x${EXPECTED_POOLMINSIZE}" ] \
+          || [ "x${pg_num}" != "x${pg_placement_num}" ] || [ "x${crush_rule}" != "x${expectedCrushRuleId}" ]; then
+            echo "Pool ${name} has incorrect parameters!!! Size=${size}, Min_Size=${min_size}, PG=${pg_num}, PGP=${pg_placement_num}, Rule=${crush_rule}"
+            exit 1
+          else
+            echo "Pool ${name} seems configured properly. Size=${size}, Min_Size=${min_size}, PG=${pg_num}, PGP=${pg_placement_num}, Rule=${crush_rule}"
+          fi
+        fi
+      done
+    }
+    
+    function pool_failuredomain_validation() {
+      echo "#### Start: Checking Pools are configured with specific failure domain ####"
+    
+      expectedCrushRuleId=""
+      nrules=$(echo ${OSD_CRUSH_RULE_DUMP} | jq length)
+      c=$[nrules-1]
+      for n in $(seq 0 ${c})
+      do
+        osd_crush_rule_obj=$(echo ${OSD_CRUSH_RULE_DUMP} | jq -r .[${n}])
+    
+        name=$(echo ${osd_crush_rule_obj} | jq -r .rule_name)
+    
+        if [ "x${EXPECTED_CRUSHRULE}" == "x${name}" ]; then
+          expectedCrushRuleId=$(echo ${osd_crush_rule_obj} | jq .rule_id)
+          echo "Checking against rule: id: ${expectedCrushRuleId}, name:${name}"
+        fi
+      done
+    
+      echo "Checking OSD pools are configured with Crush rule name:${EXPECTED_CRUSHRULE}, id:${expectedCrushRuleId}"
+    
+      npools=$(echo ${OSD_POOLS_DETAILS} | jq length)
+      i=$[npools-1]
+      for p in $(seq 0 ${i})
+      do
+        pool_obj=$(echo ${OSD_POOLS_DETAILS} | jq -r ".[${p}]")
+    
+        pool_crush_rule_id=$(echo $pool_obj | jq -r .crush_rule)
+        pool_name=$(echo $pool_obj | jq -r .pool_name)
+    
+        if [ "x${pool_crush_rule_id}" == "x${expectedCrushRuleId}" ]; then
+          echo "--> Info: Pool ${pool_name} is configured with the correct rule ${pool_crush_rule_id}"
+        else
+          echo "--> Error : Pool ${pool_name} is NOT configured with the correct rule ${pool_crush_rule_id}"
+          exit 1
+        fi
+      done
+    }
+    
+    function pg_validation() {
+      inactive_pgs=(`ceph --cluster ${CLUSTER} pg ls | tail -n +2 | grep -v "active+"|awk '{ print $1 }'`)
+      if [ ${#inactive_pgs[*]} -gt 0 ];then
+        echo "There are few incomplete pgs in the cluster"
+        echo ${inactive_pgs[*]}
+        exit 1
+      fi
+    }
+    
+    
+    check_osd_count
+    mgr_validation
+    
+    OSD_POOLS_DETAILS=$(ceph osd pool ls detail -f json-pretty)
+    OSD_CRUSH_RULE_DUMP=$(ceph osd crush rule dump -f json-pretty)
+    PG_STAT=$(ceph pg stat -f json-pretty)
+    
+    
+    pg_validation
+    pool_validation
+    pool_failuredomain_validation
+    check_failure_domain_count_per_pool
+    check_cluster_status
+    
+  utils-checkDNS.sh: |
+    #!/bin/bash
+    
+    
+    
+    : "${CEPH_CONF:="/etc/ceph/${CLUSTER}.conf"}"
+    ENDPOINT="{$1}"
+    
+    function check_mon_dns () {
+      GREP_CMD=$(grep -rl 'ceph-mon' ${CEPH_CONF})
+    
+      if [[ "${ENDPOINT}" == "up" ]]; then
+        echo "If DNS is working, we are good here"
+      elif [[ "${ENDPOINT}" != "" ]]; then
+        if [[ ${GREP_CMD} != "" ]]; then
+          # No DNS, write CEPH MONs IPs into ${CEPH_CONF}
+          sh -c -e "cat ${CEPH_CONF}.template | sed 's/mon_host.*/mon_host = ${ENDPOINT}/g' | tee ${CEPH_CONF}" > /dev/null 2>&1
+        else
+          echo "endpoints are already cached in ${CEPH_CONF}"
+          exit
+        fi
+      fi
+    }
+    
+    check_mon_dns
+    
+    exit
+    
+  utils-checkDNS_start.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -xe
+    
+    function check_mon_dns {
+      DNS_CHECK=$(getent hosts ceph-mon | head -n1)
+      PODS=$(kubectl get pods --namespace=${NAMESPACE} --selector=application=ceph --field-selector=status.phase=Running \
+             --output=jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -E 'ceph-mon|ceph-osd|ceph-mgr|ceph-mds')
+      ENDPOINT=$(kubectl get endpoints ceph-mon-discovery -n ${NAMESPACE} -o json | awk -F'"' -v port=${MON_PORT} \
+                 -v version=v1 -v msgr_version=v2 \
+                 -v msgr2_port=${MON_PORT_V2} \
+                 '/"ip"/{print "["version":"$4":"port"/"0","msgr_version":"$4":"msgr2_port"/"0"]"}' | paste -sd',')
+    
+      if [[ ${PODS} == "" || "${ENDPOINT}" == "" ]]; then
+        echo "Something went wrong, no PODS or ENDPOINTS are available!"
+      elif [[ ${DNS_CHECK} == "" ]]; then
+        for POD in ${PODS}; do
+          kubectl exec -t ${POD} --namespace=${NAMESPACE} -- \
+          sh -c -e "/tmp/utils-checkDNS.sh "${ENDPOINT}""
+        done
+      else
+        for POD in ${PODS}; do
+          kubectl exec -t ${POD} --namespace=${NAMESPACE} -- \
+          sh -c -e "/tmp/utils-checkDNS.sh up"
+        done
+      fi
+    }
+    
+    function watch_mon_dns {
+      while [ true ]; do
+        echo "checking DNS health"
+        check_mon_dns || true
+        echo "sleep 300 sec"
+        sleep 300
+      done
+    }
+    
+    watch_mon_dns
+    
+    exit
+    
+
+  utils-checkPGs.py: |
+    #!/usr/bin/python
+    
+    import subprocess  # nosec
+    import json
+    import sys
+    from argparse import *
+    
+    class cephCRUSH():
+        """
+        Currently, this script is coded to work with the ceph clusters that have
+        these type-ids -- osd, host, rack, root.  To add other type_ids to the
+        CRUSH map, this script needs enhancements to include the new type_ids.
+    
+        type_id name
+        ------- ----
+              0 osd
+              1 host
+              2 chassis
+              3 rack
+              4 row
+              5 pdu
+              6 pod
+              7 room
+              8 datacenter
+              9 region
+             10 root
+    
+        Ceph organizes the CRUSH map in hierarchical topology.  At the top, it is
+        the root.  The next levels are racks, hosts, and OSDs, respectively.  The
+        OSDs are at the leaf level.  This script looks at OSDs in each placement
+        group of a ceph pool.  For each OSD, starting from the OSD leaf level, this
+        script traverses up to the root.  Along the way, the host and rack are
+        recorded and then verified to make sure the paths to the root are in
+        separate failure domains.  This script reports the offending PGs to stdout.
+        """
+    
+        """
+        This list stores the ceph crush hierarchy retrieved from the
+        ceph osd crush tree -f json-pretty
+        """
+        crushHierarchy = []
+    
+        """
+        Failure Domains - currently our crush map uses these type IDs - osd,
+        host, rack, root
+        If we need to add chassis type (or other types) later on, add the
+        type to the if statement in the crushFD construction section.
+    
+        crushFD[0] = {'id': -2, 'name': 'host1', 'type': 'host'}
+        crushFD[23] = {'id': -5, 'name': 'host2', 'type': 'host'}
+        crushFD[68] = {'id': -7, 'name': 'host3', 'type': 'host'}
+        rack_FD[-2] = {'id': -9, 'name': 'rack1', 'type': 'rack' }
+        rack_FD[-15] = {'id': -17, 'name': 'rack2', 'type': 'rack' }
+        root_FD[-17] = {'id': -1, 'name': 'default', 'type': 'root' }}
+        root_FD[-9] = {'id': -1, 'name': 'default', 'type': 'root' }}
+        """
+        crushFD = {}
+    
+        def __init__(self, poolName):
+            if 'all' in poolName or 'All' in poolName:
+                try:
+                    poolLs = 'ceph osd pool ls -f json-pretty'
+                    poolstr = subprocess.check_output(poolLs, shell=True)  # nosec
+                    self.listPoolName = json.loads(poolstr)
+                except subprocess.CalledProcessError as e:
+                    print('{}'.format(e))
+                    """Unable to get all pools - cannot proceed"""
+                    sys.exit(2)
+            else:
+                self.listPoolName = poolName
+    
+            try:
+                """Retrieve the crush hierarchies"""
+                crushTree = "ceph osd crush tree -f json-pretty | jq .nodes"
+                chstr = subprocess.check_output(crushTree, shell=True)  # nosec
+                self.crushHierarchy = json.loads(chstr)
+            except subprocess.CalledProcessError as e:
+                print('{}'.format(e))
+                """Unable to get crush hierarchy - cannot proceed"""
+                sys.exit(2)
+    
+            """
+            Number of racks configured in the ceph cluster.  The racks that are
+            present in the crush hierarchy may not be used.  The un-used rack
+            would not show up in the crushFD.
+            """
+            self.count_racks = 0
+    
+            """depth level - 3 is OSD, 2 is host, 1 is rack, 0 is root"""
+            self.osd_depth = 0
+            """Construct the Failure Domains - OSD -> Host -> Rack -> Root"""
+            for chitem in self.crushHierarchy:
+                if chitem['type'] == 'host' or \
+                   chitem['type'] == 'rack' or \
+                   chitem['type'] == 'root':
+                    for child in chitem['children']:
+                        self.crushFD[child] = {'id': chitem['id'], 'name': chitem['name'], 'type': chitem['type']}
+                    if chitem['type'] == 'rack' and len(chitem['children']) > 0:
+                        self.count_racks += 1
+                elif chitem['type'] == 'osd':
+                    if self.osd_depth == 0:
+                        self.osd_depth = chitem['depth']
+    
+            """[ { 'pg-name' : [osd.1, osd.2, osd.3] } ... ]"""
+            self.poolPGs = []
+            """Replica of the pool.  Initialize to 0."""
+            self.poolSize = 0
+    
+        def isNautilus(self):
+            grepResult = int(subprocess.check_output('ceph mon versions | egrep -q "nautilus" | echo $?', shell=True))  # nosec
+            return grepResult == 0
+    
+        def getPoolSize(self, poolName):
+            """
+            size (number of replica) is an attribute of a pool
+            { "pool": "rbd", "pool_id": 1, "size": 3 }
+            """
+            pSize = {}
+            """Get the size attribute of the poolName"""
+            try:
+                poolGet = 'ceph osd pool get ' + poolName + ' size -f json-pretty'
+                szstr = subprocess.check_output(poolGet, shell=True)  # nosec
+                pSize = json.loads(szstr)
+                self.poolSize = pSize['size']
+            except subprocess.CalledProcessError as e:
+                print('{}'.format(e))
+                self.poolSize = 0
+                """Continue on"""
+            return
+    
+        def checkPGs(self, poolName):
+            poolPGs = self.poolPGs['pg_stats'] if self.isNautilus() else self.poolPGs
+            if not poolPGs:
+                return
+            print('Checking PGs in pool {} ...'.format(poolName)),
+            badPGs = False
+            for pg in poolPGs:
+                osdUp = pg['up']
+                """
+                Construct the OSD path from the leaf to the root.  If the
+                replica is set to 3 and there are 3 racks.  Each OSD has its
+                own rack (failure domain).   If more than one OSD has the
+                same rack, this is a violation.  If the number of rack is
+                one, then we need to make sure the hosts for the three OSDs
+                are different.
+                """
+                check_FD = {}
+                checkFailed = False
+                for osd in osdUp:
+                    traverseID = osd
+                    """Start the level with 1 to include the OSD leaf"""
+                    traverseLevel = 1
+                    while (self.crushFD[traverseID]['type'] != 'root'):
+                        crushType = self.crushFD[traverseID]['type']
+                        crushName = self.crushFD[traverseID]['name']
+                        if crushType in check_FD:
+                            check_FD[crushType].append(crushName)
+                        else:
+                            check_FD[crushType] = [crushName]
+                        """traverse up (to the root) one level"""
+                        traverseID = self.crushFD[traverseID]['id']
+                        traverseLevel += 1
+                    if not (traverseLevel == self.osd_depth):
+                        raise Exception("OSD depth mismatch")
+                """
+                check_FD should have
+                {
+                 'host': ['host1', 'host2', 'host3', 'host4'],
+                 'rack': ['rack1', 'rack2', 'rack3']
+                }
+                Not checking for the 'root' as there is only one root.
+                """
+                for ktype in check_FD:
+                    kvalue = check_FD[ktype]
+                    if ktype == 'host':
+                        """
+                        At the host level, every OSD should come from different
+                        host.  It is a violation if duplicate hosts are found.
+                        """
+                        if len(kvalue) != len(set(kvalue)):
+                            if not badPGs:
+                                print('Failed')
+                            badPGs = True
+                            print('OSDs {} in PG {} failed check in host {}'.format(pg['up'], pg['pgid'], kvalue))
+                    elif ktype == 'rack':
+                        if len(kvalue) == len(set(kvalue)):
+                            continue
+                        else:
+                            """
+                            There are duplicate racks.  This could be due to
+                            situation like pool's size is 3 and there are only
+                            two racks (or one rack).  OSDs should come from
+                            different hosts as verified in the 'host' section.
+                            """
+                            if self.count_racks == len(set(kvalue)):
+                                continue
+                            elif self.count_racks > len(set(kvalue)):
+                                """Not all the racks were used to allocate OSDs"""
+                                if not badPGs:
+                                    print('Failed')
+                                badPGs = True
+                                print('OSDs {} in PG {} failed check in rack {}'.format(pg['up'], pg['pgid'], kvalue))
+                check_FD.clear()
+            if not badPGs:
+                print('Passed')
+            return
+    
+        def checkPoolPGs(self):
+            for pool in self.listPoolName:
+                self.getPoolSize(pool)
+                if self.poolSize == 1:
+                    """No need to check pool with the size set to 1 copy"""
+                    print('Checking PGs in pool {} ... {}'.format(pool, 'Skipped'))
+                    continue
+                elif self.poolSize == 0:
+                    print('Pool {} was not found.'.format(pool))
+                    continue
+                if not self.poolSize > 1:
+                    raise Exception("Pool size was incorrectly set")
+    
+                try:
+                    """Get the list of PGs in the pool"""
+                    lsByPool = 'ceph pg ls-by-pool ' + pool + ' -f json-pretty'
+                    pgstr = subprocess.check_output(lsByPool, shell=True)  # nosec
+                    self.poolPGs = json.loads(pgstr)
+                    """Check that OSDs in the PG are in separate failure domains"""
+                    self.checkPGs(pool)
+                except subprocess.CalledProcessError as e:
+                    print('{}'.format(e))
+                    """Continue to the next pool (if any)"""
+            return
+    
+    def Main():
+        parser = ArgumentParser(description='''
+    Cross-check the OSDs assigned to the Placement Groups (PGs) of a ceph pool
+    with the CRUSH topology.  The cross-check compares the OSDs in a PG and
+    verifies the OSDs reside in separate failure domains.  PGs with OSDs in
+    the same failure domain are flagged as violation.  The offending PGs are
+    printed to stdout.
+    
+    This CLI is executed on-demand on a ceph-mon pod.  To invoke the CLI, you
+    can specify one pool or list of pools to check.  The special pool name
+    All (or all) checks all the pools in the ceph cluster.
+    ''',
+        formatter_class=RawTextHelpFormatter)
+        parser.add_argument('PoolName', type=str, nargs='+',
+          help='List of pools (or All) to validate the PGs and OSDs mapping')
+        args = parser.parse_args()
+    
+        if ('all' in args.PoolName or
+            'All' in args.PoolName) and len(args.PoolName) > 1:
+            print('You only need to give one pool with special pool All')
+            sys.exit(1)
+    
+        """
+        Retrieve the crush hierarchies and store it.  Cross-check the OSDs
+        in each PG searching for failure domain violation.
+        """
+        ccm = cephCRUSH(args.PoolName)
+        ccm.checkPoolPGs()
+    
+    if __name__ == '__main__':
+        Main()
+    
+  utils-checkPGs.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    mgrPod=$(kubectl get pods --namespace=${DEPLOYMENT_NAMESPACE} --selector=application=ceph --selector=component=mgr --output=jsonpath={.items[0].metadata.name} 2>/dev/null)
+    
+    kubectl exec -t ${mgrPod} --namespace=${DEPLOYMENT_NAMESPACE} -- /tmp/utils-checkPGs.py All 2>/dev/null
+    
+
+  utils-defragOSDs.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    PODS=$(kubectl get pods --namespace=${NAMESPACE} \
+      --selector=application=ceph,component=osd --field-selector=status.phase=Running \
+      '--output=jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}')
+    
+    for POD in ${PODS}; do
+      kubectl exec -t ${POD} --namespace=${NAMESPACE} -- \
+      sh -c -e "/tmp/utils-defragOSDs.sh"
+    done
+    
+    
+    exit 0
+    

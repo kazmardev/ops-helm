@@ -1,0 +1,103 @@
+---
+# Source: ceph-client/templates/cronjob-defragosds.yaml
+
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ceph-defragosds
+  namespace: ceph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ceph-defragosds
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+      - pods/exec
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ceph-defragosds
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ceph-defragosds
+subjects:
+  - kind: ServiceAccount
+    name: ceph-defragosds
+    namespace: ceph
+---
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: ceph-defragosds
+  annotations:
+    "openstackhelm.openstack.org/release_uuid": ""
+spec:
+  schedule: "*/15 * * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 60
+  jobTemplate:
+    metadata:
+      labels:
+        release_group: release-name
+        application: ceph
+        component: ceph-defragosds
+    spec:
+      template:
+        metadata:
+          labels:
+            release_group: release-name
+            application: ceph
+            component: ceph-defragosds
+        spec:
+          serviceAccountName: ceph-defragosds
+          nodeSelector:
+            ceph-mgr: enabled
+          containers:
+          - name: ceph-defragosds
+            image: "docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200416"
+            imagePullPolicy: IfNotPresent
+            env:
+              - name: NAMESPACE
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.namespace
+              - name: KUBECTL_PARAM
+                value:           -l application=ceph -l component=ceph-defragosd
+            command:
+              - /tmp/utils-defragOSDs.sh
+              - cron
+            volumeMounts:
+              - name: pod-tmp
+                mountPath: /tmp
+              - name: pod-etc-ceph
+                mountPath: /etc/ceph
+              - name: ceph-client-bin
+                mountPath: /tmp/utils-defragOSDs.sh
+                subPath: utils-defragOSDs.sh
+                readOnly: true
+          restartPolicy: Never
+          hostNetwork: true
+          volumes:
+            - name: pod-tmp
+              emptyDir: {}
+            - name: pod-etc-ceph
+              emptyDir: {}
+            - name: ceph-client-bin
+              configMap:
+                name:  ceph-client-bin
+                defaultMode: 0555

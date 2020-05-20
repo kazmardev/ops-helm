@@ -1,0 +1,192 @@
+---
+# Source: ceph-client/templates/job-rbd-pool.yaml
+
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ceph-rbd-pool
+  namespace: ceph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: release-name-ceph-rbd-pool
+  namespace: ceph
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: release-name-ceph-ceph-rbd-pool
+subjects:
+  - kind: ServiceAccount
+    name: ceph-rbd-pool
+    namespace: ceph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: release-name-ceph-ceph-rbd-pool
+  namespace: ceph
+rules:
+  - apiGroups:
+      - ""
+      - extensions
+      - batch
+      - apps
+    verbs:
+      - get
+      - list
+    resources:
+      - services
+      - endpoints
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ceph-rbd-pool
+  annotations:
+    "openstackhelm.openstack.org/release_uuid": ""
+spec:
+  template:
+    metadata:
+      name: ceph-rbd-pool
+      labels:
+        release_group: release-name
+        application: ceph
+        component: rbd-pool
+      annotations:
+        
+        container.apparmor.security.beta.kubernetes.io/ceph-rbd-pool: runtime/default
+        container.apparmor.security.beta.kubernetes.io/init: runtime/default
+    spec:
+      securityContext:
+        runAsUser: 65534
+        
+      serviceAccountName: ceph-rbd-pool
+      restartPolicy: OnFailure
+      affinity:
+        
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: release_group
+                    operator: In
+                    values:
+                    - release-name
+                  - key: application
+                    operator: In
+                    values:
+                    - ceph
+                  - key: component
+                    operator: In
+                    values:
+                    - rbd-pool
+                  
+              topologyKey: kubernetes.io/hostname
+            weight: 10
+      nodeSelector:
+        openstack-control-plane: enabled
+      initContainers:
+        
+        - name: init
+          image: "quay.io/airshipit/kubernetes-entrypoint:v1.0.0"
+          imagePullPolicy: IfNotPresent  
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65534
+            
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: INTERFACE_NAME
+              value: eth0
+            - name: PATH
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/
+            - name: DEPENDENCY_SERVICE
+              value: "ceph:ceph-mon,ceph:ceph-mgr"
+            - name: DEPENDENCY_DAEMONSET
+              value: ""
+            - name: DEPENDENCY_CONTAINER
+              value: ""
+            - name: DEPENDENCY_POD_JSON
+              value: ""
+            - name: DEPENDENCY_CUSTOM_RESOURCE
+              value: ""
+          command:
+            - kubernetes-entrypoint
+          volumeMounts:
+            []
+            
+      containers:
+        - name: ceph-rbd-pool
+          image: "docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200416"
+          imagePullPolicy: IfNotPresent
+          
+          
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            
+          env:
+            - name: CLUSTER
+              value: "ceph"
+            - name: ENABLE_AUTOSCALER
+              value: "true"
+          command:
+            - /tmp/pool-init.sh
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: ceph-client-bin
+              mountPath: /tmp/pool-init.sh
+              subPath: pool-init.sh
+              readOnly: true
+            - name: ceph-client-bin
+              mountPath: /tmp/pool-calc.py
+              subPath: pool-calc.py
+              readOnly: true
+            - name: ceph-client-etc
+              mountPath: /etc/ceph/ceph.conf
+              subPath: ceph.conf
+              readOnly: true
+            - name: ceph-client-admin-keyring
+              mountPath: /etc/ceph/ceph.client.admin.keyring
+              subPath: ceph.client.admin.keyring
+              readOnly: true
+            - name: pod-var-lib-ceph
+              mountPath: /var/lib/ceph
+              readOnly: false
+            - name: pod-run
+              mountPath: /run
+              readOnly: false
+      volumes:
+        - name: pod-tmp
+          emptyDir: {}
+        - name: ceph-client-etc
+          configMap:
+            name: ceph-client-etc
+            defaultMode: 0444
+        - name: ceph-client-bin
+          configMap:
+            name: ceph-client-bin
+            defaultMode: 0555
+        - name: pod-var-lib-ceph
+          emptyDir: {}
+        - name: pod-run
+          emptyDir:
+            medium: "Memory"
+        - name: ceph-client-admin-keyring
+          secret:
+            secretName: ceph-client-admin-keyring

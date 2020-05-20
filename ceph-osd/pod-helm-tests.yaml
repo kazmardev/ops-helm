@@ -1,0 +1,155 @@
+---
+# Source: ceph-osd/templates/pod-helm-tests.yaml
+
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: release-name-test
+  namespace: ceph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: release-name-release-name-test
+  namespace: ceph
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: release-name-ceph-release-name-test
+subjects:
+  - kind: ServiceAccount
+    name: release-name-test
+    namespace: ceph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: release-name-ceph-release-name-test
+  namespace: ceph
+rules:
+  - apiGroups:
+      - ""
+      - extensions
+      - batch
+      - apps
+    verbs:
+      - get
+      - list
+    resources:
+      - services
+      - endpoints
+      - jobs
+      - pods
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: release-name-test
+  labels:
+    release_group: release-name
+    application: ceph-osd
+    component: test
+  annotations:
+    "helm.sh/hook": test-success
+spec:
+  securityContext:
+    runAsUser: 65534
+    
+  restartPolicy: Never
+  serviceAccountName: release-name-test
+  nodeSelector:
+    openstack-control-plane: enabled
+  initContainers:
+    
+    - name: init
+      image: "quay.io/airshipit/kubernetes-entrypoint:v1.0.0"
+      imagePullPolicy: IfNotPresent  
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        runAsUser: 65534
+        
+      env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        - name: INTERFACE_NAME
+          value: eth0
+        - name: PATH
+          value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/
+        - name: DEPENDENCY_SERVICE
+          value: "ceph:ceph-mon"
+        - name: DEPENDENCY_JOBS
+          value: "ceph-storage-keys-generator,ceph-osd-keyring-generator"
+        - name: DEPENDENCY_DAEMONSET
+          value: ""
+        - name: DEPENDENCY_CONTAINER
+          value: ""
+        - name: DEPENDENCY_POD_JSON
+          value: ""
+        - name: DEPENDENCY_CUSTOM_RESOURCE
+          value: ""
+      command:
+        - kubernetes-entrypoint
+      volumeMounts:
+        []
+        
+  containers:
+    - name: ceph-cluster-helm-test
+      image: "docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200416"
+      imagePullPolicy: IfNotPresent
+      
+      
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        
+      env:
+        - name: CEPH_DEPLOYMENT_NAMESPACE
+          value: ceph
+        - name: REQUIRED_PERCENT_OF_OSDS
+          value: "75"
+      command:
+        - /tmp/helm-tests.sh
+      volumeMounts:
+        - name: pod-tmp
+          mountPath: /tmp
+        - name: pod-etc-ceph
+          mountPath: /etc/ceph
+        - name: ceph-osd-bin
+          mountPath: /tmp/helm-tests.sh
+          subPath: helm-tests.sh
+          readOnly: true
+        - name: ceph-client-admin-keyring
+          mountPath: /etc/ceph/ceph.client.admin.keyring
+          subPath: ceph.client.admin.keyring
+          readOnly: true
+        - name: ceph-osd-etc
+          mountPath: /etc/ceph/ceph.conf
+          subPath: ceph.conf
+          readOnly: true
+  volumes:
+    - name: pod-tmp
+      emptyDir: {}
+    - name: pod-etc-ceph
+      emptyDir: {}
+    - name: ceph-osd-bin
+      configMap:
+        name: "release-name-bin"
+        defaultMode: 0555
+    - name: ceph-client-admin-keyring
+      secret:
+        secretName: ceph-client-admin-keyring
+    - name: ceph-osd-etc
+      configMap:
+        name: "release-name-etc"
+        defaultMode: 0444

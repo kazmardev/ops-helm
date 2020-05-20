@@ -1,0 +1,541 @@
+---
+# Source: ceph-mon/templates/configmap-bin.yaml
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ceph-mon-bin
+data:
+  bootstrap.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    ceph -s
+    function ensure_pool () {
+      ceph osd pool stats $1 || ceph osd pool create $1 $2
+      local test_version=$(ceph tell osd.* version | egrep -c "nautilus|mimic|luminous" | xargs echo)
+      if [[ ${test_version} -gt 0 ]]; then
+        ceph osd pool application enable $1 $3
+      fi
+    }
+    #ensure_pool volumes 8 cinder
+    
+    
+
+  init-dirs.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    export LC_ALL=C
+    : "${HOSTNAME:=$(uname -n)}"
+    : "${MGR_NAME:=${HOSTNAME}}"
+    : "${MDS_NAME:=mds-${HOSTNAME}}"
+    : "${MDS_BOOTSTRAP_KEYRING:=/var/lib/ceph/bootstrap-mds/${CLUSTER}.keyring}"
+    : "${OSD_BOOTSTRAP_KEYRING:=/var/lib/ceph/bootstrap-osd/${CLUSTER}.keyring}"
+    
+    for keyring in ${OSD_BOOTSTRAP_KEYRING} ${MDS_BOOTSTRAP_KEYRING} ; do
+      mkdir -p "$(dirname "$keyring")"
+    done
+    
+    # Let's create the ceph directories
+    for DIRECTORY in mon osd mds radosgw tmp mgr; do
+      mkdir -p "/var/lib/ceph/${DIRECTORY}"
+    done
+    
+    # Create socket directory
+    mkdir -p /run/ceph
+    
+    # Create the MDS directory
+    mkdir -p "/var/lib/ceph/mds/${CLUSTER}-${MDS_NAME}"
+    
+    # Create the MGR directory
+    mkdir -p "/var/lib/ceph/mgr/${CLUSTER}-${MGR_NAME}"
+    
+    # Adjust the owner of all those directories
+    chown -R ceph. /run/ceph/ /var/lib/ceph/*
+    
+
+  keys-bootstrap-keyring-generator.py: |
+    #!/bin/python
+    import os
+    import struct
+    import time
+    import base64
+    key = os.urandom(16)
+    header = struct.pack(
+        '<hiih',
+        1,                 # le16 type: CEPH_CRYPTO_AES
+        int(time.time()),  # le32 created: seconds
+        0,                 # le32 created: nanoseconds,
+        len(key),          # le16: len(key)
+    )
+    print(base64.b64encode(header + key).decode('ascii'))
+    
+  keys-bootstrap-keyring-manager.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    
+    
+    function ceph_gen_key () {
+      python ${CEPH_GEN_DIR}/keys-bootstrap-keyring-generator.py
+    }
+    
+    function kube_ceph_keyring_gen () {
+      CEPH_KEY=$1
+      CEPH_KEY_TEMPLATE=$2
+      sed "s|{{ key }}|${CEPH_KEY}|" ${CEPH_TEMPLATES_DIR}/${CEPH_KEY_TEMPLATE} | base64 -w0 | tr -d '\n'
+    }
+    
+    function create_kube_key () {
+      CEPH_KEYRING=$1
+      CEPH_KEYRING_NAME=$2
+      CEPH_KEYRING_TEMPLATE=$3
+      KUBE_SECRET_NAME=$4
+      if ! kubectl get --namespace ${DEPLOYMENT_NAMESPACE} secrets ${KUBE_SECRET_NAME}; then
+        {
+          cat <<EOF
+    ---
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: ${KUBE_SECRET_NAME}
+      labels:
+        release_group: release-name
+        application: ceph
+        component: bootstrap
+    type: Opaque
+    data:
+      ${CEPH_KEYRING_NAME}: $( kube_ceph_keyring_gen ${CEPH_KEYRING} ${CEPH_KEYRING_TEMPLATE} )
+    EOF
+        } | kubectl apply --namespace ${DEPLOYMENT_NAMESPACE} -f -
+      fi
+    }
+    
+    #create_kube_key <ceph_key> <ceph_keyring_name> <ceph_keyring_template> <kube_secret_name>
+    create_kube_key $(ceph_gen_key) ${CEPH_KEYRING_NAME} ${CEPH_KEYRING_TEMPLATE} ${KUBE_SECRET_NAME}
+    
+    
+  keys-storage-keyring-manager.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    
+    function ceph_gen_key () {
+      python ${CEPH_GEN_DIR}/keys-bootstrap-keyring-generator.py
+    }
+    
+    function kube_ceph_keyring_gen () {
+      CEPH_KEY=$1
+      CEPH_KEY_TEMPLATE=$2
+      sed "s|{{ key }}|${CEPH_KEY}|" ${CEPH_TEMPLATES_DIR}/${CEPH_KEY_TEMPLATE} | base64 -w0 | tr -d '\n'
+    }
+    
+    CEPH_CLIENT_KEY=$(ceph_gen_key)
+    
+    function create_kube_key () {
+      CEPH_KEYRING=$1
+      CEPH_KEYRING_NAME=$2
+      CEPH_KEYRING_TEMPLATE=$3
+      KUBE_SECRET_NAME=$4
+    
+      if ! kubectl get --namespace ${DEPLOYMENT_NAMESPACE} secrets ${KUBE_SECRET_NAME}; then
+        {
+          cat <<EOF
+    ---
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: ${KUBE_SECRET_NAME}
+      labels:
+        release_group: release-name
+        application: ceph
+        component: admin
+    type: Opaque
+    data:
+      ${CEPH_KEYRING_NAME}: $( kube_ceph_keyring_gen ${CEPH_KEYRING} ${CEPH_KEYRING_TEMPLATE} )
+    EOF
+        } | kubectl apply --namespace ${DEPLOYMENT_NAMESPACE} -f -
+      fi
+    }
+    #create_kube_key <ceph_key> <ceph_keyring_name> <ceph_keyring_template> <kube_secret_name>
+    create_kube_key ${CEPH_CLIENT_KEY} ${CEPH_KEYRING_NAME} ${CEPH_KEYRING_TEMPLATE} ${CEPH_KEYRING_ADMIN_NAME}
+    
+    function create_kube_storage_key () {
+      CEPH_KEYRING=$1
+      KUBE_SECRET_NAME=$2
+    
+      if ! kubectl get --namespace ${DEPLOYMENT_NAMESPACE} secrets ${KUBE_SECRET_NAME}; then
+        {
+          cat <<EOF
+    ---
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: ${KUBE_SECRET_NAME}
+      labels:
+        release_group: release-name
+        application: ceph
+        component: admin
+    type: kubernetes.io/rbd
+    data:
+      key: $( echo ${CEPH_KEYRING} | base64 | tr -d '\n' )
+    EOF
+        } | kubectl apply --namespace ${DEPLOYMENT_NAMESPACE} -f -
+      fi
+    }
+    #create_kube_storage_key <ceph_key> <kube_secret_name>
+    create_kube_storage_key ${CEPH_CLIENT_KEY} ${CEPH_STORAGECLASS_ADMIN_SECRET_NAME}
+    
+    
+    
+
+  mon-start.sh: |
+    #!/bin/bash
+    set -ex
+    export LC_ALL=C
+    : "${K8S_HOST_NETWORK:=0}"
+    : "${MON_KEYRING:=/etc/ceph/${CLUSTER}.mon.keyring}"
+    : "${ADMIN_KEYRING:=/etc/ceph/${CLUSTER}.client.admin.keyring}"
+    : "${MDS_BOOTSTRAP_KEYRING:=/var/lib/ceph/bootstrap-mds/${CLUSTER}.keyring}"
+    : "${OSD_BOOTSTRAP_KEYRING:=/var/lib/ceph/bootstrap-osd/${CLUSTER}.keyring}"
+    : "${CEPH_CONF:="/etc/ceph/${CLUSTER}.conf"}"
+    
+    if [[ ! -e ${CEPH_CONF}.template ]]; then
+      echo "ERROR- ${CEPH_CONF}.template must exist; get it from your existing mon"
+      exit 1
+    else
+      ENDPOINT=$(kubectl get endpoints ceph-mon-discovery -n ${NAMESPACE} -o json | awk -F'"' -v port=${MON_PORT} \
+                 -v version=v1 -v msgr_version=v2 \
+                 -v msgr2_port=${MON_PORT_V2} \
+                 '/"ip"/{print "["version":"$4":"port"/"0","msgr_version":"$4":"msgr2_port"/"0"]"}' | paste -sd',')
+      if [[ "${ENDPOINT}" == "" ]]; then
+        /bin/sh -c -e "cat ${CEPH_CONF}.template | tee ${CEPH_CONF}" || true
+      else
+        /bin/sh -c -e "cat ${CEPH_CONF}.template | sed 's#mon_host.*#mon_host = ${ENDPOINT}#g' | tee ${CEPH_CONF}" || true
+      fi
+    fi
+    
+    if [[ -z "$CEPH_PUBLIC_NETWORK" ]]; then
+      echo "ERROR- CEPH_PUBLIC_NETWORK must be defined as the name of the network for the OSDs"
+      exit 1
+    fi
+    
+    if [[ -z "$MON_IP" ]]; then
+      echo "ERROR- MON_IP must be defined as the IP address of the monitor"
+      exit 1
+    fi
+    
+    if [[ ${K8S_HOST_NETWORK} -eq 0 ]]; then
+        MON_NAME=${POD_NAME}
+    else
+        MON_NAME=${NODE_NAME}
+    fi
+    MON_DATA_DIR="/var/lib/ceph/mon/${CLUSTER}-${MON_NAME}"
+    MONMAP="/etc/ceph/monmap-${CLUSTER}"
+    
+    # Make the monitor directory
+    su -s /bin/sh -c "mkdir -p \"${MON_DATA_DIR}\"" ceph
+    
+    function get_mon_config {
+      # Get fsid from ceph.conf
+      local fsid=$(ceph-conf --lookup fsid -c /etc/ceph/${CLUSTER}.conf)
+    
+      timeout=10
+      MONMAP_ADD=""
+    
+      while [[ -z "${MONMAP_ADD// }" && "${timeout}" -gt 0 ]]; do
+        # Get the ceph mon pods (name and IP) from the Kubernetes API. Formatted as a set of monmap params
+        if [[ ${K8S_HOST_NETWORK} -eq 0 ]]; then
+            MONMAP_ADD=$(kubectl get pods --namespace=${NAMESPACE} ${KUBECTL_PARAM} -o template --template="{{range .items}}{{if .status.podIP}}--addv {{.metadata.name}} [v1:{{.status.podIP}}:${MON_PORT},v2:{{.status.podIP}}:${MON_PORT_V2}] {{end}} {{end}}")
+        else
+            MONMAP_ADD=$(kubectl get pods --namespace=${NAMESPACE} ${KUBECTL_PARAM} -o template --template="{{range .items}}{{if .status.podIP}}--addv {{.spec.nodeName}} [v1:{{.status.podIP}}:${MON_PORT},v2:{{.status.podIP}}:${MON_PORT_V2}] {{end}} {{end}}")
+        fi
+        (( timeout-- ))
+        sleep 1
+      done
+    
+      if [[ -z "${MONMAP_ADD// }" ]]; then
+          exit 1
+      fi
+    
+      # Create a monmap with the Pod Names and IP
+      monmaptool --create ${MONMAP_ADD} --fsid ${fsid} ${MONMAP} --clobber
+    }
+    
+    get_mon_config
+    
+    # If we don't have a monitor keyring, this is a new monitor
+    if [ ! -e "${MON_DATA_DIR}/keyring" ]; then
+      if [ ! -e ${MON_KEYRING}.seed ]; then
+        echo "ERROR- ${MON_KEYRING}.seed must exist. You can extract it from your current monitor by running 'ceph auth get mon. -o ${MON_KEYRING}' or use a KV Store"
+        exit 1
+      else
+        cp -vf ${MON_KEYRING}.seed ${MON_KEYRING}
+      fi
+    
+      if [ ! -e ${MONMAP} ]; then
+        echo "ERROR- ${MONMAP} must exist. You can extract it from your current monitor by running 'ceph mon getmap -o ${MONMAP}' or use a KV Store"
+        exit 1
+      fi
+    
+      # Testing if it's not the first monitor, if one key doesn't exist we assume none of them exist
+      for KEYRING in ${OSD_BOOTSTRAP_KEYRING} ${MDS_BOOTSTRAP_KEYRING} ${ADMIN_KEYRING}; do
+        ceph-authtool ${MON_KEYRING} --import-keyring ${KEYRING}
+      done
+    
+      # Prepare the monitor daemon's directory with the map and keyring
+      ceph-mon --setuser ceph --setgroup ceph --cluster "${CLUSTER}" --mkfs -i ${MON_NAME} --inject-monmap ${MONMAP} --keyring ${MON_KEYRING} --mon-data "${MON_DATA_DIR}"
+    else
+      echo "Trying to get the most recent monmap..."
+      # Ignore when we timeout, in most cases that means the cluster has no quorum or
+      # no mons are up and running yet
+      timeout 5 ceph --cluster "${CLUSTER}" mon getmap -o ${MONMAP} || true
+      ceph-mon --setuser ceph --setgroup ceph --cluster "${CLUSTER}" -i ${MON_NAME} --inject-monmap ${MONMAP} --keyring ${MON_KEYRING} --mon-data "${MON_DATA_DIR}"
+      timeout 7 ceph --cluster "${CLUSTER}" mon add "${MON_NAME}" "${MON_IP}:${MON_PORT_V2}" || true
+    fi
+    
+    # start MON
+    exec /usr/bin/ceph-mon \
+      --cluster "${CLUSTER}" \
+      --setuser "ceph" \
+      --setgroup "ceph" \
+      -d \
+      -i ${MON_NAME} \
+      --mon-data "${MON_DATA_DIR}" \
+      --public-addr "${MON_IP}:${MON_PORT_V2}"
+    
+  mon-stop.sh: |
+    #!/bin/bash
+    
+    set -ex
+    
+    NUMBER_OF_MONS=$(ceph mon stat | awk '$3 == "mons" {print $2}')
+    if [[ "${NUMBER_OF_MONS}" -gt "3" ]]; then
+      if [[ ${K8S_HOST_NETWORK} -eq 0 ]]; then
+          ceph mon remove "${POD_NAME}"
+      else
+          ceph mon remove "${NODE_NAME}"
+      fi
+    else
+      echo "doing nothing since we are running less than or equal to 3 mons"
+    fi
+    
+  mon-check.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    COMMAND="${@:-liveness}"
+    : ${K8S_HOST_NETWORK:=0}
+    
+    function heath_check () {
+      SOCKDIR=${CEPH_SOCKET_DIR:-/run/ceph}
+      SBASE=${CEPH_OSD_SOCKET_BASE:-ceph-mon}
+      SSUFFIX=${CEPH_SOCKET_SUFFIX:-asok}
+    
+      MON_ID=$(ps auwwx | grep ceph-mon | grep -v "$1" | grep -v grep | sed 's/.*-i\ //;s/\ .*//'|awk '{print $1}')
+    
+      if [ -z "${MON_ID}" ]; then
+        if [[ ${K8S_HOST_NETWORK} -eq 0 ]]; then
+            MON_NAME=${POD_NAME}
+        else
+            MON_NAME=${NODE_NAME}
+        fi
+      fi
+    
+      if [ -S "${SOCKDIR}/${SBASE}.${MON_NAME}.${SSUFFIX}" ]; then
+       MON_STATE=$(ceph -f json-pretty --connect-timeout 1 --admin-daemon "${SOCKDIR}/${SBASE}.${MON_NAME}.${SSUFFIX}" mon_status|grep state|sed 's/.*://;s/[^a-z]//g')
+       echo "MON ${MON_ID} ${MON_STATE}";
+       # this might be a stricter check than we actually want.  what are the
+       # other values for the "state" field?
+       for S in ${MON_LIVE_STATE}; do
+        if [ "x${MON_STATE}x" = "x${S}x" ]; then
+         exit 0
+        fi
+       done
+      fi
+      # if we made it this far, things are not running
+      exit 1
+    }
+    
+    function liveness () {
+      MON_LIVE_STATE="probing electing synchronizing leader peon"
+      heath_check
+    }
+    
+    function readiness () {
+      MON_LIVE_STATE="leader peon"
+      heath_check
+    }
+    
+    $COMMAND
+    
+
+  moncheck-start.sh: |
+    #!/bin/bash
+    set -ex
+    export LC_ALL=C
+    : "${CEPH_CONF:="/etc/ceph/${CLUSTER}.conf"}"
+    
+    if [[ ! -e ${CEPH_CONF}.template ]]; then
+      echo "ERROR- ${CEPH_CONF}.template must exist; get it from your existing mon"
+      exit 1
+    else
+      ENDPOINT=$(kubectl get endpoints ceph-mon -n ${NAMESPACE} -o json | awk -F'"' -v port=${MON_PORT} '/ip/{print $4":"port}' | paste -sd',')
+      if [[ ${ENDPOINT} == "" ]]; then
+        /bin/sh -c -e "cat ${CEPH_CONF}.template | tee ${CEPH_CONF}" || true
+      else
+        /bin/sh -c -e "cat ${CEPH_CONF}.template | sed 's/mon_host.*/mon_host = ${ENDPOINT}/g' | tee ${CEPH_CONF}" || true
+      fi
+    fi
+    
+    function check_mon_msgr2 {
+     if [[ -z "$(ceph mon versions | grep ceph\ version | grep -v nautilus)" ]]; then
+       if ceph health detail|grep -i "MON_MSGR2_NOT_ENABLED"; then
+         echo "ceph-mon msgr v2 not enabled on all ceph mons so enabling"
+         ceph mon enable-msgr2
+       fi
+     fi
+    }
+    
+    
+    function watch_mon_health {
+      while [ true ]; do
+        echo "checking for zombie mons"
+        /tmp/moncheck-reap-zombies.py || true
+        echo "checking for ceph-mon msgr v2"
+        check_mon_msgr2
+        echo "sleep 30 sec"
+        sleep 30
+      done
+    }
+    
+    watch_mon_health
+    
+  moncheck-reap-zombies.py: |
+    #!/usr/bin/python
+    import re
+    import os
+    import subprocess  # nosec
+    import json
+    
+    MON_REGEX = r"^\d: ([0-9\.]*):\d+/\d* mon.([^ ]*)$"
+    # kubctl_command = 'kubectl get pods --namespace=${NAMESPACE} -l component=mon,application=ceph -o template --template="{ }}range .items}} \\"}}.metadata.name}}\\": \\"}}.status.podIP}}\\" ,   }}end}} }"'
+    if int(os.getenv('K8S_HOST_NETWORK', 0)) > 0:
+        kubectl_command = 'kubectl get pods --namespace=${NAMESPACE} -l component=mon,application=ceph -o template --template="{ {{range  \$i, \$v  := .items}} {{ if \$i}} , {{ end }} \\"{{\$v.spec.nodeName}}\\": \\"{{\$v.status.podIP}}\\" {{end}} }"'
+    else:
+        kubectl_command = 'kubectl get pods --namespace=${NAMESPACE} -l component=mon,application=ceph -o template --template="{ {{range  \$i, \$v  := .items}} {{ if \$i}} , {{ end }} \\"{{\$v.metadata.name}}\\": \\"{{\$v.status.podIP}}\\" {{end}} }"'
+    
+    monmap_command = "ceph --cluster=${CLUSTER} mon getmap > /tmp/monmap && monmaptool -f /tmp/monmap --print"
+    
+    
+    def extract_mons_from_monmap():
+        monmap = subprocess.check_output(monmap_command, shell=True)  # nosec
+        mons = {}
+        for line in monmap.split("\n"):
+            m = re.match(MON_REGEX, line)
+            if m is not None:
+                mons[m.group(2)] = m.group(1)
+        return mons
+    
+    def extract_mons_from_kubeapi():
+        kubemap = subprocess.check_output(kubectl_command, shell=True)  # nosec
+        return json.loads(kubemap)
+    
+    current_mons = extract_mons_from_monmap()
+    expected_mons = extract_mons_from_kubeapi()
+    
+    print("current mons: %s" % current_mons)
+    print("expected mons: %s" % expected_mons)
+    
+    removed_mon = False
+    for mon in current_mons:
+        if not mon in expected_mons:
+            print("removing zombie mon %s" % mon)
+            subprocess.call(["ceph", "--cluster", os.environ["NAMESPACE"], "mon", "remove", mon])  # nosec
+            removed_mon = True
+        elif current_mons[mon] != expected_mons[mon]: # check if for some reason the ip of the mon changed
+            print("ip change detected for pod %s" % mon)
+            subprocess.call(["kubectl", "--namespace", os.environ["NAMESPACE"], "delete", "pod", mon])  # nosec
+            removed_mon = True
+            print("deleted mon %s via the kubernetes api" % mon)
+    
+    
+    if not removed_mon:
+        print("no zombie mons found ...")
+    
+
+  utils-checkObjectReplication.py: |
+    #!/usr/bin/python
+    
+    import subprocess  # nosec
+    import json
+    import sys
+    import collections
+    
+    if (int(len(sys.argv)) == 1):
+        print("Please provide pool name to test , example: checkObjectReplication.py  <pool name>")
+        sys.exit(1)
+    else:
+        poolName = sys.argv[1]
+        cmdRep = 'ceph osd map' + ' ' + str(poolName) + ' ' +  'testreplication -f json-pretty'
+        objectRep  = subprocess.check_output(cmdRep, shell=True)  # nosec
+        repOut = json.loads(objectRep)
+        osdNumbers = repOut['up']
+        print("Test object got replicated on these osds: %s" % str(osdNumbers))
+    
+        osdHosts= []
+        for osd in osdNumbers:
+            cmdFind = 'ceph osd find' +  ' ' + str(osd)
+            osdFind = subprocess.check_output(cmdFind , shell=True)  # nosec
+            osdHost = json.loads(osdFind)
+            osdHostLocation = osdHost['crush_location']
+            osdHosts.append(osdHostLocation['host'])
+    
+        print("Test object got replicated on these hosts: %s" % str(osdHosts))
+    
+        print("Hosts hosting multiple copies of a placement groups are: %s" %
+              str([item for item, count in collections.Counter(osdHosts).items() if count > 1]))
+        sys.exit(0)
+    
+  utils-checkDNS.sh: |
+    #!/bin/bash
+    
+    
+    
+    : "${CEPH_CONF:="/etc/ceph/${CLUSTER}.conf"}"
+    ENDPOINT="{$1}"
+    
+    function check_mon_dns () {
+      GREP_CMD=$(grep -rl 'ceph-mon' ${CEPH_CONF})
+    
+      if [[ "${ENDPOINT}" == "up" ]]; then
+        echo "If DNS is working, we are good here"
+      elif [[ "${ENDPOINT}" != "" ]]; then
+        if [[ ${GREP_CMD} != "" ]]; then
+          # No DNS, write CEPH MONs IPs into ${CEPH_CONF}
+          sh -c -e "cat ${CEPH_CONF}.template | sed 's/mon_host.*/mon_host = ${ENDPOINT}/g' | tee ${CEPH_CONF}" > /dev/null 2>&1
+        else
+          echo "endpoints are already cached in ${CEPH_CONF}"
+          exit
+        fi
+      fi
+    }
+    
+    check_mon_dns
+    
+    exit
+    

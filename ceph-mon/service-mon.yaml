@@ -1,0 +1,23 @@
+---
+# Source: ceph-mon/templates/service-mon.yaml
+
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: ceph-mon
+spec:
+  ports:
+  - name: mon
+    port: 6789
+    protocol: TCP
+    targetPort: 6789
+  - name: mon-msgr2
+    port: 3300
+    protocol: TCP
+    targetPort: 3300
+  selector:
+    release_group: release-name
+    application: ceph
+    component: mon
+  clusterIP: None

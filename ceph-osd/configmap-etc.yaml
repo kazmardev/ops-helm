@@ -1,0 +1,72 @@
+---
+# Source: ceph-osd/templates/configmap-etc.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: release-name-etc
+data:
+  ceph.conf: |
+    [global]
+    cephx = true
+    cephx_cluster_require_signatures = true
+    cephx_require_signatures = false
+    cephx_service_require_signatures = false
+    debug_ms = 0/0
+    fsid = 4f2e3b63-280a-4c42-a75e-0072646c0eab
+    mon_host = ceph-mon.ceph.svc.cluster.local:3300
+    mon_osd_down_out_interval = 1800
+    mon_osd_down_out_subtree_limit = root
+    mon_osd_min_in_ratio = 0
+    mon_osd_min_up_ratio = 0
+    objecter_inflight_op_bytes = 1073741824
+    objecter_inflight_ops = 10240
+    [osd]
+    cluster_network = 20.0.0.0/24
+    filestore_max_sync_interval = 10
+    filestore_merge_threshold = -10
+    filestore_split_multiple = 12
+    ms_bind_port_max = 7100
+    ms_bind_port_min = 6800
+    osd_crush_update_on_start = false
+    osd_deep_scrub_stride = 1048576
+    osd_journal_size = 10240
+    osd_max_object_name_len = 256
+    osd_mkfs_options_xfs = -f -i size=2048
+    osd_mkfs_type = xfs
+    osd_mount_options_xfs = rw,noatime,largeio,inode64,swalloc,logbufs=8,logbsize=256k,allocsize=4M
+    osd_pg_max_concurrent_snap_trims = 1
+    osd_recovery_max_active = 1
+    osd_recovery_op_priority = 1
+    osd_scrub_begin_hour = 22
+    osd_scrub_chunk_max = 4
+    osd_scrub_chunk_min = 1
+    osd_scrub_during_recovery = false
+    osd_scrub_end_hour = 4
+    osd_scrub_load_threshold = 10
+    osd_scrub_priority = 1
+    osd_scrub_sleep = 0.1
+    osd_snap_trim_priority = 1
+    osd_snap_trim_sleep = 0.1
+    public_network = 20.0.0.0/24
+    [target]
+    required_percent_of_osds = 75
+    
+  storage.json: |
+    {
+      "failure_domain": "host",
+      "failure_domain_by_hostname": "false",
+      "failure_domain_name": "false",
+      "osd": [
+        {
+          "data": {
+            "location": "/var/lib/openstack-helm/ceph/osd/osd-one",
+            "type": "directory"
+          },
+          "journal": {
+            "location": "/var/lib/openstack-helm/ceph/osd/journal-one",
+            "type": "directory"
+          }
+        }
+      ]
+    }

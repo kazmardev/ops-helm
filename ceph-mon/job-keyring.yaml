@@ -1,0 +1,579 @@
+---
+# Source: ceph-mon/templates/job-keyring.yaml
+
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ceph-mds-keyring-generator
+  namespace: ceph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ceph-mds-keyring-generator
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ceph-mds-keyring-generator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ceph-mds-keyring-generator
+subjects:
+  - kind: ServiceAccount
+    name: ceph-mds-keyring-generator
+    namespace: ceph
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ceph-mds-keyring-generator
+  annotations:
+    "openstackhelm.openstack.org/release_uuid": ""
+spec:
+  template:
+    metadata:
+      labels:
+        release_group: release-name
+        application: ceph
+        component: mds-keyring-generator
+    spec:
+      serviceAccountName: ceph-mds-keyring-generator
+      restartPolicy: OnFailure
+      nodeSelector:
+        openstack-control-plane: enabled
+      initContainers:
+        
+        - name: init
+          image: "quay.io/airshipit/kubernetes-entrypoint:v1.0.0"
+          imagePullPolicy: IfNotPresent  
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65534
+            
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: INTERFACE_NAME
+              value: eth0
+            - name: PATH
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/
+            - name: DEPENDENCY_SERVICE
+              value: ""
+            - name: DEPENDENCY_DAEMONSET
+              value: ""
+            - name: DEPENDENCY_CONTAINER
+              value: ""
+            - name: DEPENDENCY_POD_JSON
+              value: ""
+            - name: DEPENDENCY_CUSTOM_RESOURCE
+              value: ""
+          command:
+            - kubernetes-entrypoint
+          volumeMounts:
+            []
+            
+      containers:
+        - name:  ceph-mds-keyring-generator
+          image: "docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200416"
+          imagePullPolicy: IfNotPresent
+          
+          env:
+            - name: DEPLOYMENT_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: CEPH_GEN_DIR
+              value: /tmp
+            - name: CEPH_TEMPLATES_DIR
+              value: /tmp/templates
+            - name: CEPH_KEYRING_NAME
+              value: ceph.keyring
+            - name: CEPH_KEYRING_TEMPLATE
+              value: bootstrap.keyring.mds
+            - name: KUBE_SECRET_NAME
+              value: ceph-bootstrap-mds-keyring
+          command:
+            - /tmp/keys-bootstrap-keyring-manager.sh
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: pod-etc-ceph
+              mountPath: /etc/ceph
+            - name: ceph-mon-bin
+              mountPath: /tmp/keys-bootstrap-keyring-manager.sh
+              subPath: keys-bootstrap-keyring-manager.sh
+              readOnly: true
+            - name: ceph-mon-bin
+              mountPath: /tmp/keys-bootstrap-keyring-generator.py
+              subPath: keys-bootstrap-keyring-generator.py
+              readOnly: true
+            - name: ceph-templates
+              mountPath: /tmp/templates
+              readOnly: true
+      volumes:
+        - name: pod-tmp
+          emptyDir: {}
+        - name: pod-etc-ceph
+          emptyDir: {}
+        - name: ceph-mon-bin
+          configMap:
+            name: ceph-mon-bin
+            defaultMode: 0555
+        - name: ceph-templates
+          configMap:
+            name: ceph-templates
+            defaultMode: 0444
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ceph-osd-keyring-generator
+  namespace: ceph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ceph-osd-keyring-generator
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ceph-osd-keyring-generator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ceph-osd-keyring-generator
+subjects:
+  - kind: ServiceAccount
+    name: ceph-osd-keyring-generator
+    namespace: ceph
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ceph-osd-keyring-generator
+  annotations:
+    "openstackhelm.openstack.org/release_uuid": ""
+spec:
+  template:
+    metadata:
+      labels:
+        release_group: release-name
+        application: ceph
+        component: osd-keyring-generator
+    spec:
+      serviceAccountName: ceph-osd-keyring-generator
+      restartPolicy: OnFailure
+      nodeSelector:
+        openstack-control-plane: enabled
+      initContainers:
+        
+        - name: init
+          image: "quay.io/airshipit/kubernetes-entrypoint:v1.0.0"
+          imagePullPolicy: IfNotPresent  
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65534
+            
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: INTERFACE_NAME
+              value: eth0
+            - name: PATH
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/
+            - name: DEPENDENCY_SERVICE
+              value: ""
+            - name: DEPENDENCY_DAEMONSET
+              value: ""
+            - name: DEPENDENCY_CONTAINER
+              value: ""
+            - name: DEPENDENCY_POD_JSON
+              value: ""
+            - name: DEPENDENCY_CUSTOM_RESOURCE
+              value: ""
+          command:
+            - kubernetes-entrypoint
+          volumeMounts:
+            []
+            
+      containers:
+        - name:  ceph-osd-keyring-generator
+          image: "docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200416"
+          imagePullPolicy: IfNotPresent
+          
+          env:
+            - name: DEPLOYMENT_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: CEPH_GEN_DIR
+              value: /tmp
+            - name: CEPH_TEMPLATES_DIR
+              value: /tmp/templates
+            - name: CEPH_KEYRING_NAME
+              value: ceph.keyring
+            - name: CEPH_KEYRING_TEMPLATE
+              value: bootstrap.keyring.osd
+            - name: KUBE_SECRET_NAME
+              value: ceph-bootstrap-osd-keyring
+          command:
+            - /tmp/keys-bootstrap-keyring-manager.sh
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: pod-etc-ceph
+              mountPath: /etc/ceph
+            - name: ceph-mon-bin
+              mountPath: /tmp/keys-bootstrap-keyring-manager.sh
+              subPath: keys-bootstrap-keyring-manager.sh
+              readOnly: true
+            - name: ceph-mon-bin
+              mountPath: /tmp/keys-bootstrap-keyring-generator.py
+              subPath: keys-bootstrap-keyring-generator.py
+              readOnly: true
+            - name: ceph-templates
+              mountPath: /tmp/templates
+              readOnly: true
+      volumes:
+        - name: pod-tmp
+          emptyDir: {}
+        - name: pod-etc-ceph
+          emptyDir: {}
+        - name: ceph-mon-bin
+          configMap:
+            name: ceph-mon-bin
+            defaultMode: 0555
+        - name: ceph-templates
+          configMap:
+            name: ceph-templates
+            defaultMode: 0444
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ceph-mon-keyring-generator
+  namespace: ceph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ceph-mon-keyring-generator
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ceph-mon-keyring-generator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ceph-mon-keyring-generator
+subjects:
+  - kind: ServiceAccount
+    name: ceph-mon-keyring-generator
+    namespace: ceph
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ceph-mon-keyring-generator
+  annotations:
+    "openstackhelm.openstack.org/release_uuid": ""
+spec:
+  template:
+    metadata:
+      labels:
+        release_group: release-name
+        application: ceph
+        component: mon-keyring-generator
+    spec:
+      serviceAccountName: ceph-mon-keyring-generator
+      restartPolicy: OnFailure
+      nodeSelector:
+        openstack-control-plane: enabled
+      initContainers:
+        
+        - name: init
+          image: "quay.io/airshipit/kubernetes-entrypoint:v1.0.0"
+          imagePullPolicy: IfNotPresent  
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65534
+            
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: INTERFACE_NAME
+              value: eth0
+            - name: PATH
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/
+            - name: DEPENDENCY_SERVICE
+              value: ""
+            - name: DEPENDENCY_DAEMONSET
+              value: ""
+            - name: DEPENDENCY_CONTAINER
+              value: ""
+            - name: DEPENDENCY_POD_JSON
+              value: ""
+            - name: DEPENDENCY_CUSTOM_RESOURCE
+              value: ""
+          command:
+            - kubernetes-entrypoint
+          volumeMounts:
+            []
+            
+      containers:
+        - name:  ceph-mon-keyring-generator
+          image: "docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200416"
+          imagePullPolicy: IfNotPresent
+          
+          env:
+            - name: DEPLOYMENT_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: CEPH_GEN_DIR
+              value: /tmp
+            - name: CEPH_TEMPLATES_DIR
+              value: /tmp/templates
+            - name: CEPH_KEYRING_NAME
+              value: ceph.mon.keyring
+            - name: CEPH_KEYRING_TEMPLATE
+              value: mon.keyring
+            - name: KUBE_SECRET_NAME
+              value: ceph-mon-keyring
+          command:
+            - /tmp/keys-bootstrap-keyring-manager.sh
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: pod-etc-ceph
+              mountPath: /etc/ceph
+            - name: ceph-mon-bin
+              mountPath: /tmp/keys-bootstrap-keyring-manager.sh
+              subPath: keys-bootstrap-keyring-manager.sh
+              readOnly: true
+            - name: ceph-mon-bin
+              mountPath: /tmp/keys-bootstrap-keyring-generator.py
+              subPath: keys-bootstrap-keyring-generator.py
+              readOnly: true
+            - name: ceph-templates
+              mountPath: /tmp/templates
+              readOnly: true
+      volumes:
+        - name: pod-tmp
+          emptyDir: {}
+        - name: pod-etc-ceph
+          emptyDir: {}
+        - name: ceph-mon-bin
+          configMap:
+            name: ceph-mon-bin
+            defaultMode: 0555
+        - name: ceph-templates
+          configMap:
+            name: ceph-templates
+            defaultMode: 0444
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ceph-mgr-keyring-generator
+  namespace: ceph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ceph-mgr-keyring-generator
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ceph-mgr-keyring-generator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ceph-mgr-keyring-generator
+subjects:
+  - kind: ServiceAccount
+    name: ceph-mgr-keyring-generator
+    namespace: ceph
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ceph-mgr-keyring-generator
+  annotations:
+    "openstackhelm.openstack.org/release_uuid": ""
+spec:
+  template:
+    metadata:
+      labels:
+        release_group: release-name
+        application: ceph
+        component: mgr-keyring-generator
+    spec:
+      serviceAccountName: ceph-mgr-keyring-generator
+      restartPolicy: OnFailure
+      nodeSelector:
+        openstack-control-plane: enabled
+      initContainers:
+        
+        - name: init
+          image: "quay.io/airshipit/kubernetes-entrypoint:v1.0.0"
+          imagePullPolicy: IfNotPresent  
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65534
+            
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: INTERFACE_NAME
+              value: eth0
+            - name: PATH
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/
+            - name: DEPENDENCY_SERVICE
+              value: ""
+            - name: DEPENDENCY_DAEMONSET
+              value: ""
+            - name: DEPENDENCY_CONTAINER
+              value: ""
+            - name: DEPENDENCY_POD_JSON
+              value: ""
+            - name: DEPENDENCY_CUSTOM_RESOURCE
+              value: ""
+          command:
+            - kubernetes-entrypoint
+          volumeMounts:
+            []
+            
+      containers:
+        - name:  ceph-mgr-keyring-generator
+          image: "docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200416"
+          imagePullPolicy: IfNotPresent
+          
+          env:
+            - name: DEPLOYMENT_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: CEPH_GEN_DIR
+              value: /tmp
+            - name: CEPH_TEMPLATES_DIR
+              value: /tmp/templates
+            - name: CEPH_KEYRING_NAME
+              value: ceph.keyring
+            - name: CEPH_KEYRING_TEMPLATE
+              value: bootstrap.keyring.mgr
+            - name: KUBE_SECRET_NAME
+              value: ceph-bootstrap-mgr-keyring
+          command:
+            - /tmp/keys-bootstrap-keyring-manager.sh
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: pod-etc-ceph
+              mountPath: /etc/ceph
+            - name: ceph-mon-bin
+              mountPath: /tmp/keys-bootstrap-keyring-manager.sh
+              subPath: keys-bootstrap-keyring-manager.sh
+              readOnly: true
+            - name: ceph-mon-bin
+              mountPath: /tmp/keys-bootstrap-keyring-generator.py
+              subPath: keys-bootstrap-keyring-generator.py
+              readOnly: true
+            - name: ceph-templates
+              mountPath: /tmp/templates
+              readOnly: true
+      volumes:
+        - name: pod-tmp
+          emptyDir: {}
+        - name: pod-etc-ceph
+          emptyDir: {}
+        - name: ceph-mon-bin
+          configMap:
+            name: ceph-mon-bin
+            defaultMode: 0555
+        - name: ceph-templates
+          configMap:
+            name: ceph-templates
+            defaultMode: 0444

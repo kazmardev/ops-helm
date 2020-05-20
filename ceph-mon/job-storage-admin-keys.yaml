@@ -1,0 +1,164 @@
+---
+# Source: ceph-mon/templates/job-storage-admin-keys.yaml
+
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ceph-storage-keys-generator
+  namespace: ceph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ceph-storage-keys-generator
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ceph-storage-keys-generator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ceph-storage-keys-generator
+subjects:
+  - kind: ServiceAccount
+    name: ceph-storage-keys-generator
+    namespace: ceph
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ceph-storage-keys-generator
+  annotations:
+    "openstackhelm.openstack.org/release_uuid": ""
+spec:
+  template:
+    metadata:
+      labels:
+        release_group: release-name
+        application: ceph
+        component: storage-keys-generator
+      annotations:
+        "openstackhelm.openstack.org/release_uuid": ""
+        configmap-bin-hash: "08969de325d0d29e2f9feea3f329f524d0090c053b8b6f413fbd99732c068d8d"
+        configmap-etc-hash: "d40a22b44a60f201e541d4ac90debedd4cb1c943a4090a4fc332f19eb96f4f5a"
+        
+        container.apparmor.security.beta.kubernetes.io/ceph-storage-keys-generator: runtime/default
+        container.apparmor.security.beta.kubernetes.io/init: runtime/default
+    spec:
+      securityContext:
+        runAsUser: 65534
+        
+      serviceAccountName: ceph-storage-keys-generator
+      restartPolicy: OnFailure
+      nodeSelector:
+        openstack-control-plane: enabled
+      initContainers:
+        
+        - name: init
+          image: "quay.io/airshipit/kubernetes-entrypoint:v1.0.0"
+          imagePullPolicy: IfNotPresent  
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65534
+            
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: INTERFACE_NAME
+              value: eth0
+            - name: PATH
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/
+            - name: DEPENDENCY_SERVICE
+              value: ""
+            - name: DEPENDENCY_DAEMONSET
+              value: ""
+            - name: DEPENDENCY_CONTAINER
+              value: ""
+            - name: DEPENDENCY_POD_JSON
+              value: ""
+            - name: DEPENDENCY_CUSTOM_RESOURCE
+              value: ""
+          command:
+            - kubernetes-entrypoint
+          volumeMounts:
+            []
+            
+      containers:
+        - name:  ceph-storage-keys-generator
+          image: "docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200416"
+          imagePullPolicy: IfNotPresent
+          
+          
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            
+          env:
+            - name: DEPLOYMENT_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: CEPH_GEN_DIR
+              value: /tmp
+            - name: CEPH_TEMPLATES_DIR
+              value: /tmp/templates
+            - name: CEPH_KEYRING_NAME
+              value: ceph.client.admin.keyring
+            - name: CEPH_KEYRING_TEMPLATE
+              value: admin.keyring
+            - name: CEPH_KEYRING_ADMIN_NAME
+              value: ceph-client-admin-keyring
+            - name: CEPH_STORAGECLASS_ADMIN_SECRET_NAME
+              value: pvc-ceph-conf-combined-storageclass
+          command:
+            - /tmp/keys-storage-keyring-manager.sh
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: pod-etc-ceph
+              mountPath: /etc/ceph
+            - name: ceph-mon-bin
+              mountPath: /tmp/keys-storage-keyring-manager.sh
+              subPath: keys-storage-keyring-manager.sh
+              readOnly: true
+            - name: ceph-mon-bin
+              mountPath: /tmp/keys-bootstrap-keyring-generator.py
+              subPath: keys-bootstrap-keyring-generator.py
+              readOnly: true
+            - name: ceph-templates
+              mountPath: /tmp/templates
+              readOnly: true
+      volumes:
+        - name: pod-tmp
+          emptyDir: {}
+        - name: pod-etc-ceph
+          emptyDir: {}
+        - name: ceph-mon-bin
+          configMap:
+            name: ceph-mon-bin
+            defaultMode: 0555
+        - name: ceph-templates
+          configMap:
+            name: ceph-templates
+            defaultMode: 0444

@@ -1,0 +1,1982 @@
+---
+# Source: ceph-osd/templates/configmap-bin.yaml
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: "release-name-bin"
+data:
+  bootstrap.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    ceph -s
+    
+    
+  osd-start.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    echo "LAUNCHING OSD: in ${STORAGE_TYPE%-*}:${STORAGE_TYPE#*-} mode"
+    exec "/tmp/osd-${STORAGE_TYPE%-*}-${DEPLOY_TOOL}.sh"
+    
+  log-tail.sh: |
+    #!/bin/bash
+    set -ex
+    
+    osd_id_file="/tmp/osd-id"
+    
+    function wait_for_file() {
+      local file="$1"; shift
+      local wait_seconds="${1:-30}"; shift
+    
+      until test $((wait_seconds--)) -eq 0 -o -f "$file" ; do
+        sleep 1
+      done
+    
+      ((++wait_seconds))
+    }
+    wait_for_file "${osd_id_file}" "${WAIT_FOR_OSD_ID_TIMEOUT}"
+    
+    log_file="/var/log/ceph/${DAEMON_NAME}.$(cat "${osd_id_file}").log"
+    wait_for_file "${log_file}" "${WAIT_FOR_OSD_ID_TIMEOUT}"
+    
+    function tail_file () {
+      while true; do
+        tail --retry -f "${log_file}"
+      done
+    }
+    
+    function truncate_log () {
+      while true; do
+        sleep ${TRUNCATE_PERIOD}
+        if [[ -f ${log_file} ]] ; then
+          truncate -s "${TRUNCATE_SIZE}" "${log_file}"
+        fi
+      done
+    }
+    
+    tail_file &
+    truncate_log &
+    
+    wait -n
+    
+  osd-directory-ceph-disk.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    export LC_ALL=C
+    
+    source /tmp/osd-common-ceph-disk.sh
+    
+    : "${JOURNAL_DIR:=/var/lib/ceph/journal}"
+    
+    if [[ ! -d /var/lib/ceph/osd ]]; then
+      echo "ERROR- could not find the osd directory, did you bind mount the OSD data directory?"
+      echo "ERROR- use -v <host_osd_data_dir>:/var/lib/ceph/osd"
+      exit 1
+    fi
+    
+    # check if anything is present, if not, create an osd and its directory
+    if [[ -n "$(find /var/lib/ceph/osd -type d  -empty ! -name "lost+found")" ]]; then
+      echo "Creating osd"
+      UUID=$(uuidgen)
+      OSD_SECRET=$(ceph-authtool --gen-print-key)
+      OSD_ID=$(echo "{\"cephx_secret\": \"${OSD_SECRET}\"}" | ceph osd new ${UUID} -i - -n client.bootstrap-osd -k "$OSD_BOOTSTRAP_KEYRING")
+    
+      # test that the OSD_ID is an integer
+      if [[ "$OSD_ID" =~ ^-?[0-9]+$ ]]; then
+        echo "OSD created with ID: ${OSD_ID}"
+      else
+        echo "OSD creation failed: ${OSD_ID}"
+        exit 1
+      fi
+    
+      OSD_PATH="$OSD_PATH_BASE-$OSD_ID/"
+      if [ -n "${JOURNAL_DIR}" ]; then
+         OSD_JOURNAL="${JOURNAL_DIR}/journal.${OSD_ID}"
+         chown -R ceph. ${JOURNAL_DIR}
+      else
+         if [ -n "${JOURNAL}" ]; then
+            OSD_JOURNAL=${JOURNAL}
+            chown -R ceph. $(dirname ${JOURNAL_DIR})
+         else
+            OSD_JOURNAL=${OSD_PATH%/}/journal
+         fi
+      fi
+      # create the folder and own it
+      mkdir -p "${OSD_PATH}"
+      chown "${CHOWN_OPT[@]}" ceph. "${OSD_PATH}"
+      echo "created folder ${OSD_PATH}"
+      # write the secret to the osd keyring file
+      ceph-authtool --create-keyring ${OSD_PATH%/}/keyring --name osd.${OSD_ID} --add-key ${OSD_SECRET}
+      OSD_KEYRING="${OSD_PATH%/}/keyring"
+      # init data directory
+      ceph-osd -i ${OSD_ID} --mkfs --osd-uuid ${UUID} --mkjournal --osd-journal ${OSD_JOURNAL} --setuser ceph --setgroup ceph
+      # add the osd to the crush map
+      # NOTE(supamatt): set the initial crush weight of the OSD to 0 to prevent automatic rebalancing
+      OSD_WEIGHT=0
+      # NOTE(supamatt): add or move the OSD's CRUSH location
+      crush_location
+    fi
+    
+    # create the directory and an empty Procfile
+    mkdir -p /etc/forego/"${CLUSTER}"
+    echo "" > /etc/forego/"${CLUSTER}"/Procfile
+    
+    
+    for OSD_ID in $(ls /var/lib/ceph/osd | sed 's/.*-//'); do
+      # NOTE(gagehugo): Writing the OSD_ID to tmp for logging
+      echo "${OSD_ID}" > /tmp/osd-id
+      OSD_PATH="$OSD_PATH_BASE-$OSD_ID/"
+      OSD_KEYRING="${OSD_PATH%/}/keyring"
+      if [ -n "${JOURNAL_DIR}" ]; then
+         OSD_JOURNAL="${JOURNAL_DIR}/journal.${OSD_ID}"
+         chown -R ceph. ${JOURNAL_DIR}
+      else
+         if [ -n "${JOURNAL}" ]; then
+            OSD_JOURNAL=${JOURNAL}
+            chown -R ceph. $(dirname ${JOURNAL_DIR})
+         else
+            OSD_JOURNAL=${OSD_PATH%/}/journal
+            chown ceph. ${OSD_JOURNAL}
+         fi
+      fi
+      # log osd filesystem type
+      FS_TYPE=`stat --file-system -c "%T" ${OSD_PATH}`
+      echo "OSD $OSD_PATH filesystem type: $FS_TYPE"
+    
+      # NOTE(supamatt): Just in case permissions do not align up, we recursively set them correctly.
+      if [ $(stat -c%U ${OSD_PATH}) != ceph ]; then
+        chown -R ceph. ${OSD_PATH};
+      fi
+    
+      crush_location
+      echo "${CLUSTER}-${OSD_ID}: /usr/bin/ceph-osd --cluster ${CLUSTER} -f -i ${OSD_ID} --osd-journal ${OSD_JOURNAL} -k ${OSD_KEYRING}" | tee -a /etc/forego/"${CLUSTER}"/Procfile
+    done
+    
+    exec /usr/local/bin/forego start -f /etc/forego/"${CLUSTER}"/Procfile
+    
+  osd-block-ceph-disk.sh: |
+    #!/bin/bash
+    
+    
+    
+    source /tmp/osd-common-ceph-disk.sh
+    
+    set -ex
+    
+    : "${OSD_SOFT_FORCE_ZAP:=1}"
+    : "${OSD_JOURNAL_DISK:=}"
+    
+    if [ "x${STORAGE_TYPE%-*}" == "xdirectory" ]; then
+      export OSD_DEVICE="/var/lib/ceph/osd"
+    else
+      export OSD_DEVICE=$(readlink -f ${STORAGE_LOCATION})
+    fi
+    
+    if [ "x$JOURNAL_TYPE" == "xdirectory" ]; then
+      export OSD_JOURNAL="/var/lib/ceph/journal"
+    else
+      export OSD_JOURNAL=$(readlink -f ${JOURNAL_LOCATION})
+    fi
+    
+    if [[ -z "${OSD_DEVICE}" ]];then
+      echo "ERROR- You must provide a device to build your OSD ie: /dev/sdb"
+      exit 1
+    fi
+    
+    if [[ ! -b "${OSD_DEVICE}" ]]; then
+      echo "ERROR- The device pointed by OSD_DEVICE ${OSD_DEVICE} doesn't exist !"
+      exit 1
+    fi
+    
+    CEPH_DISK_OPTIONS=""
+    CEPH_OSD_OPTIONS=""
+    DATA_UUID=$(blkid -o value -s PARTUUID ${OSD_DEVICE}*1)
+    
+    udev_settle
+    
+    DATA_PART=$(dev_part ${OSD_DEVICE} 1)
+    MOUNTED_PART=${DATA_PART}
+    
+    ceph-disk -v \
+      --setuser ceph \
+      --setgroup disk \
+      activate ${CEPH_DISK_OPTIONS} \
+        --no-start-daemon ${DATA_PART}
+    
+    OSD_ID=$(grep "${MOUNTED_PART}" /proc/mounts | awk '{print $2}' | grep -oh '[0-9]*')
+    
+    OSD_PATH="${OSD_PATH_BASE}-${OSD_ID}"
+    OSD_KEYRING="${OSD_PATH}/keyring"
+    # NOTE(supamatt): set the initial crush weight of the OSD to 0 to prevent automatic rebalancing
+    OSD_WEIGHT=0
+    # NOTE(supamatt): add or move the OSD's CRUSH location
+    crush_location
+    
+    if [ "${OSD_BLUESTORE:-0}" -ne 1 ]; then
+      if [ -n "${OSD_JOURNAL}" ]; then
+        if [ -b "${OSD_JOURNAL}" ]; then
+          OSD_JOURNAL_DISK="$(readlink -f ${OSD_PATH}/journal)"
+          if [ -z "${OSD_JOURNAL_DISK}" ]; then
+            echo "ERROR: Unable to find journal device ${OSD_JOURNAL_DISK}"
+            exit 1
+          else
+            OSD_JOURNAL="${OSD_JOURNAL_DISK}"
+            if [ -e "${OSD_PATH}/run_mkjournal" ]; then
+              ceph-osd -i ${OSD_ID} --mkjournal
+              rm -rf ${OSD_PATH}/run_mkjournal
+            fi
+          fi
+        fi
+        if [ "x${JOURNAL_TYPE}" == "xdirectory" ]; then
+          OSD_JOURNAL="${OSD_JOURNAL}/journal.${OSD_ID}"
+          touch ${OSD_JOURNAL}
+          wait_for_file "${OSD_JOURNAL}"
+        else
+          if [ ! -b "${OSD_JOURNAL}" ]; then
+            echo "ERROR: Unable to find journal device ${OSD_JOURNAL}"
+            exit 1
+          else
+            chown ceph. "${OSD_JOURNAL}"
+          fi
+        fi
+      else
+        wait_for_file "${OSD_JOURNAL}"
+        chown ceph. "${OSD_JOURNAL}"
+      fi
+    fi
+    
+    # NOTE(supamatt): Just in case permissions do not align up, we recursively set them correctly.
+    if [ $(stat -c%U ${OSD_PATH}) != ceph ]; then
+      chown -R ceph. ${OSD_PATH};
+    fi
+    
+    # NOTE(gagehugo): Writing the OSD_ID to tmp for logging
+    echo "${OSD_ID}" > /tmp/osd-id
+    
+    if [ "x${JOURNAL_TYPE}" == "xdirectory" ]; then
+      chown -R ceph. /var/lib/ceph/journal
+      ceph-osd \
+        --cluster ceph \
+        --osd-data ${OSD_PATH} \
+        --osd-journal ${OSD_JOURNAL} \
+        -f \
+        -i ${OSD_ID} \
+        --setuser ceph \
+        --setgroup disk \
+        --mkjournal
+    fi
+    
+    exec /usr/bin/ceph-osd \
+        --cluster ${CLUSTER} \
+        ${CEPH_OSD_OPTIONS} \
+        -f \
+        -i ${OSD_ID} \
+        --setuser ceph \
+        --setgroup disk & echo $! > /run/ceph-osd.pid
+    wait
+    
+  osd-bluestore-ceph-disk.sh: |
+    #!/bin/bash
+    
+    
+    
+    source /tmp/osd-common-ceph-disk.sh
+    
+    set -ex
+    
+    : "${OSD_SOFT_FORCE_ZAP:=1}"
+    
+    export OSD_DEVICE=$(readlink -f ${STORAGE_LOCATION})
+    
+    if [[ -z "${OSD_DEVICE}" ]];then
+      echo "ERROR- You must provide a device to build your OSD ie: /dev/sdb"
+      exit 1
+    fi
+    
+    if [[ ! -b "${OSD_DEVICE}" ]]; then
+      echo "ERROR- The device pointed by OSD_DEVICE ${OSD_DEVICE} doesn't exist !"
+      exit 1
+    fi
+    
+    CEPH_DISK_OPTIONS=""
+    CEPH_OSD_OPTIONS=""
+    DATA_UUID=$(blkid -o value -s PARTUUID ${OSD_DEVICE}*1)
+    
+    udev_settle
+    
+    DATA_PART=$(dev_part ${OSD_DEVICE} 1)
+    MOUNTED_PART=${DATA_PART}
+    
+    ceph-disk -v \
+      --setuser ceph \
+      --setgroup disk \
+      activate ${CEPH_DISK_OPTIONS} \
+        --no-start-daemon ${DATA_PART}
+    
+    OSD_ID=$(grep "${MOUNTED_PART}" /proc/mounts | awk '{print $2}' | grep -oh '[0-9]*')
+    
+    OSD_PATH="${OSD_PATH_BASE}-${OSD_ID}"
+    OSD_KEYRING="${OSD_PATH}/keyring"
+    # NOTE(supamatt): set the initial crush weight of the OSD to 0 to prevent automatic rebalancing
+    OSD_WEIGHT=0
+    # NOTE(supamatt): add or move the OSD's CRUSH location
+    crush_location
+    
+    
+    # NOTE(supamatt): Just in case permissions do not align up, we recursively set them correctly.
+    if [ $(stat -c%U ${OSD_PATH}) != ceph ]; then
+      chown -R ceph. ${OSD_PATH};
+    fi
+    
+    # NOTE(gagehugo): Writing the OSD_ID to tmp for logging
+    echo "${OSD_ID}" > /tmp/osd-id
+    
+    exec /usr/bin/ceph-osd \
+        --cluster ${CLUSTER} \
+        ${CEPH_OSD_OPTIONS} \
+        -f \
+        -i ${OSD_ID} \
+        --setuser ceph \
+        --setgroup disk & echo $! > /run/ceph-osd.pid
+    wait
+    
+  osd-init-ceph-disk.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    source /tmp/osd-common-ceph-disk.sh
+    
+    : "${OSD_FORCE_REPAIR:=1}"
+    # We do not want to zap journal disk. Tracking this option seperatly.
+    : "${JOURNAL_FORCE_ZAP:=0}"
+    
+    if [ "x${STORAGE_TYPE%-*}" == "xbluestore" ]; then
+      export OSD_BLUESTORE=1
+    fi
+    
+    if [ "x${STORAGE_TYPE%-*}" == "xdirectory" ]; then
+      export OSD_DEVICE="/var/lib/ceph/osd"
+    else
+      export OSD_DEVICE=$(readlink -f ${STORAGE_LOCATION})
+    fi
+    
+    if [ "x$JOURNAL_TYPE" == "xdirectory" ]; then
+      export OSD_JOURNAL="/var/lib/ceph/journal"
+    else
+      export OSD_JOURNAL=$(readlink -f ${JOURNAL_LOCATION})
+    fi
+    
+    function osd_disk_prepare {
+      if [[ -z "${OSD_DEVICE}" ]];then
+        echo "ERROR- You must provide a device to build your OSD ie: /dev/sdb"
+        exit 1
+      fi
+    
+      if [[ ! -b "${OSD_DEVICE}" ]]; then
+        echo "ERROR- The device pointed by OSD_DEVICE ($OSD_DEVICE) doesn't exist !"
+        exit 1
+      fi
+    
+      if [ ! -e $OSD_BOOTSTRAP_KEYRING ]; then
+        echo "ERROR- $OSD_BOOTSTRAP_KEYRING must exist. You can extract it from your current monitor by running 'ceph auth get client.bootstrap-osd -o $OSD_BOOTSTRAP_KEYRING'"
+        exit 1
+      fi
+      timeout 10 ceph ${CLI_OPTS} --name client.bootstrap-osd --keyring $OSD_BOOTSTRAP_KEYRING health || exit 1
+    
+      # check device status first
+      if ! parted --script ${OSD_DEVICE} print > /dev/null 2>&1; then
+        if [[ ${OSD_FORCE_REPAIR} -eq 1 ]]; then
+          echo "It looks like ${OSD_DEVICE} isn't consistent, however OSD_FORCE_REPAIR is enabled so we are zapping the device anyway"
+          disk_zap ${OSD_DEVICE}
+        else
+          echo "Regarding parted, device ${OSD_DEVICE} is inconsistent/broken/weird."
+          echo "It would be too dangerous to destroy it without any notification."
+          echo "Please set OSD_FORCE_REPAIR to '1' if you really want to zap this disk."
+          exit 1
+        fi
+      fi
+    
+      # then search for some ceph metadata on the disk
+      if [[ "$(parted --script ${OSD_DEVICE} print | egrep '^ 1.*ceph data')" ]]; then
+        if [[ ${OSD_FORCE_REPAIR} -eq 1 ]]; then
+          if [ -b "${OSD_DEVICE}1" ]; then
+            local cephFSID=$(ceph-conf --lookup fsid)
+            if [ ! -z "${cephFSID}"  ]; then
+              local tmpmnt=$(mktemp -d)
+              mount ${OSD_DEVICE}1 ${tmpmnt}
+              if [ "${OSD_BLUESTORE:-0}" -ne 1 ] && [ "x$JOURNAL_TYPE" != "xdirectory" ]; then
+                # we only care about journals for filestore.
+                if [  -f "${tmpmnt}/whoami" ]; then
+                  OSD_JOURNAL_DISK=$(readlink -f "${tmpmnt}/journal")
+                  local osd_id=$(cat "${tmpmnt}/whoami")
+                  if [ ! -b "${OSD_JOURNAL_DISK}" ]; then
+                    OSD_JOURNAL=$(readlink -f ${OSD_JOURNAL})
+                    local jdev=$(echo ${OSD_JOURNAL} | sed 's/[0-9]//g')
+                    if [ ${jdev} == ${OSD_JOURNAL} ]; then
+                      echo "It appears that ${OSD_DEVICE} is missing the journal at ${OSD_JOURNAL}."
+                      echo "Because OSD_FORCE_REPAIR is set, we will wipe the metadata of the OSD and zap it."
+                      rm -rf ${tmpmnt}/ceph_fsid
+                    else
+                      echo "It appears that ${OSD_DEVICE} is missing the journal at ${OSD_JOURNAL_DISK}."
+                      echo "Because OSD_FORCE_REPAIR is set and paritions are manually defined, we will"
+                      echo "attempt to recreate the missing journal device partitions."
+                      osd_journal_create ${OSD_JOURNAL}
+                      ln -sf /dev/disk/by-partuuid/${OSD_JOURNAL_UUID} ${tmpmnt}/journal
+                      echo ${OSD_JOURNAL_UUID} | tee ${tmpmnt}/journal_uuid
+                      chown ceph. ${OSD_JOURNAL}
+                      # During OSD start we will format the journal and set the fsid
+                      touch ${tmpmnt}/run_mkjournal
+                    fi
+                  fi
+                else
+                  echo "It looks like ${OSD_DEVICE} has a ceph data partition but is missing it's metadata."
+                  echo "The device may contain inconsistent metadata or be corrupted."
+                  echo "Because OSD_FORCE_REPAIR is set, we will wipe the metadata of the OSD and zap it."
+                  rm -rf ${tmpmnt}/ceph_fsid
+                fi
+              fi
+              if [ -f "${tmpmnt}/ceph_fsid" ]; then
+                osdFSID=$(cat "${tmpmnt}/ceph_fsid")
+                if [ ${osdFSID} != ${cephFSID} ]; then
+                  echo "It looks like ${OSD_DEVICE} is an OSD belonging to a different (or old) ceph cluster."
+                  echo "The OSD FSID is ${osdFSID} while this cluster is ${cephFSID}"
+                  echo "Because OSD_FORCE_REPAIR was set, we will zap this device."
+                  zap_extra_partitions ${tmpmnt}
+                  umount ${tmpmnt}
+                  disk_zap ${OSD_DEVICE}
+                else
+                  umount ${tmpmnt}
+                  echo "It looks like ${OSD_DEVICE} is an OSD belonging to a this ceph cluster."
+                  echo "OSD_FORCE_REPAIR is set, but will be ignored and the device will not be zapped."
+                  echo "Moving on, trying to activate the OSD now."
+                  return
+                fi
+              else
+                echo "It looks like ${OSD_DEVICE} has a ceph data partition but no FSID."
+                echo "Because OSD_FORCE_REPAIR was set, we will zap this device."
+                zap_extra_partitions ${tmpmnt}
+                umount ${tmpmnt}
+                disk_zap ${OSD_DEVICE}
+              fi
+            else
+              echo "Unable to determine the FSID of the current cluster."
+              echo "OSD_FORCE_REPAIR is set, but this OSD will not be zapped."
+              echo "Moving on, trying to activate the OSD now."
+              return
+            fi
+          else
+            echo "parted says ${OSD_DEVICE}1 should exist, but we do not see it."
+            echo "We will ignore OSD_FORCE_REPAIR and try to use the device as-is"
+            echo "Moving on, trying to activate the OSD now."
+            return
+          fi
+        else
+          echo "INFO- It looks like ${OSD_DEVICE} is an OSD, set OSD_FORCE_REPAIR=1 to use this device anyway and zap its content"
+          echo "You can also use the disk_zap scenario on the appropriate device to zap it"
+          echo "Moving on, trying to activate the OSD now."
+          return
+        fi
+      fi
+    
+      if [ "${OSD_BLUESTORE:-0}" -eq 1 ]; then
+        CLI_OPTS="${CLI_OPTS} --bluestore"
+    
+        if [ ! -z "$BLOCK_DB" ]; then
+          CLI_OPTS="${CLI_OPTS} --block.db ${BLOCK_DB}"
+        fi
+    
+        if [ ! -z "$BLOCK_WAL" ]; then
+          CLI_OPTS="${CLI_OPTS} --block.wal ${BLOCK_WAL}"
+        fi
+    
+        CLI_OPTS="${CLI_OPTS} ${OSD_DEVICE}"
+      else
+        # we only care about journals for filestore.
+        osd_journal_prepare
+    
+        CLI_OPTS="${CLI_OPTS} --journal-uuid ${OSD_JOURNAL_UUID} ${OSD_DEVICE}"
+    
+        if [ "x$JOURNAL_TYPE" == "xdirectory" ]; then
+          CLI_OPTS="${CLI_OPTS} --journal-file"
+        else
+          CLI_OPTS="${CLI_OPTS} ${OSD_JOURNAL}"
+        fi
+      fi
+    
+      udev_settle
+      ceph-disk -v prepare ${CLI_OPTS}
+    }
+    
+    function osd_journal_create {
+      local osd_journal=${1}
+      local osd_journal_partition=$(echo ${osd_journal} | sed 's/[^0-9]//g')
+      local jdev=$(echo ${osd_journal} | sed 's/[0-9]//g')
+      if [ -b "${jdev}" ]; then
+        sgdisk --new=${osd_journal_partition}:0:+${OSD_JOURNAL_SIZE}M \
+          --change-name='${osd_journal_partition}:ceph journal' \
+          --partition-guid=${osd_journal_partition}:${OSD_JOURNAL_UUID} \
+          --typecode=${osd_journal_partition}:45b0969e-9b03-4f30-b4c6-b4b80ceff106 --mbrtogpt -- ${jdev}
+        OSD_JOURNAL=$(dev_part ${jdev} ${osd_journal_partition})
+        udev_settle
+      else
+        echo "The backing device ${jdev} for ${OSD_JOURNAL} does not exist on this system."
+        exit 1
+      fi
+    }
+    
+    function osd_journal_prepare {
+      if [ -n "${OSD_JOURNAL}" ]; then
+        if [ -b ${OSD_JOURNAL} ]; then
+          OSD_JOURNAL=$(readlink -f ${OSD_JOURNAL})
+          OSD_JOURNAL_PARTITION=$(echo ${OSD_JOURNAL} | sed 's/[^0-9]//g')
+          local jdev=$(echo ${OSD_JOURNAL} | sed 's/[0-9]//g')
+          if [ -z "${OSD_JOURNAL_PARTITION}" ]; then
+            OSD_JOURNAL=$(dev_part ${jdev} ${OSD_JOURNAL_PARTITION})
+          else
+            OSD_JOURNAL=${OSD_JOURNAL}
+          fi
+        elif [ "x$JOURNAL_TYPE" != "xdirectory" ]; then
+          # The block device exists but doesn't appear to be paritioned, we will proceed with parititioning the device.
+          OSD_JOURNAL=$(readlink -f ${OSD_JOURNAL})
+          osd_journal_create ${OSD_JOURNAL}
+        fi
+        chown ceph. ${OSD_JOURNAL}
+      elif [ "x$JOURNAL_TYPE" != "xdirectory" ]; then
+        echo "No journal device specified. OSD and journal will share ${OSD_DEVICE}"
+        echo "For better performance on HDD, consider moving your journal to a separate device"
+      fi
+      CLI_OPTS="${CLI_OPTS} --filestore"
+    }
+    
+    if ! [ "x${STORAGE_TYPE%-*}" == "xdirectory" ]; then
+      osd_disk_prepare
+    fi
+    
+  osd-common-ceph-disk.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    : "${CRUSH_LOCATION:=root=default host=${HOSTNAME}}"
+    : "${OSD_PATH_BASE:=/var/lib/ceph/osd/${CLUSTER}}"
+    : "${CEPH_CONF:="/etc/ceph/${CLUSTER}.conf"}"
+    : "${OSD_BOOTSTRAP_KEYRING:=/var/lib/ceph/bootstrap-osd/${CLUSTER}.keyring}"
+    : "${OSD_JOURNAL_UUID:=$(uuidgen)}"
+    : "${OSD_JOURNAL_SIZE:=$(awk '/^osd_journal_size/{print $3}' ${CEPH_CONF}.template)}"
+    : "${OSD_WEIGHT:=1.0}"
+    
+    eval CRUSH_FAILURE_DOMAIN_TYPE=$(cat /etc/ceph/storage.json | python -c 'import sys, json; data = json.load(sys.stdin); print(json.dumps(data["failure_domain"]))')
+    eval CRUSH_FAILURE_DOMAIN_NAME=$(cat /etc/ceph/storage.json | python -c 'import sys, json; data = json.load(sys.stdin); print(json.dumps(data["failure_domain_name"]))')
+    eval CRUSH_FAILURE_DOMAIN_BY_HOSTNAME=$(cat /etc/ceph/storage.json | python -c 'import sys, json; data = json.load(sys.stdin); print(json.dumps(data["failure_domain_by_hostname"]))')
+    
+    if [[ $(ceph -v | egrep -q "nautilus|mimic|luminous"; echo $?) -ne 0 ]]; then
+        echo "ERROR- need Luminous/Mimic/Nautilus release"
+        exit 1
+    fi
+    
+    if [ -z "${HOSTNAME}" ]; then
+      echo "HOSTNAME not set; This will prevent to add an OSD into the CRUSH map"
+      exit 1
+    fi
+    
+    if [[ ! -e ${CEPH_CONF}.template ]]; then
+      echo "ERROR- ${CEPH_CONF}.template must exist; get it from your existing mon"
+      exit 1
+    else
+      ENDPOINT=$(kubectl get endpoints ceph-mon-discovery -n ${NAMESPACE} -o json | awk -F'"' -v port=${MON_PORT} \
+                 -v version=v1 -v msgr_version=v2 \
+                 -v msgr2_port=${MON_PORT_V2} \
+                 '/"ip"/{print "["version":"$4":"port"/"0","msgr_version":"$4":"msgr2_port"/"0"]"}' | paste -sd',')
+      if [[ "${ENDPOINT}" == "" ]]; then
+        /bin/sh -c -e "cat ${CEPH_CONF}.template | tee ${CEPH_CONF}" || true
+      else
+        /bin/sh -c -e "cat ${CEPH_CONF}.template | sed 's#mon_host.*#mon_host = ${ENDPOINT}#g' | tee ${CEPH_CONF}" || true
+      fi
+    fi
+    
+    # Wait for a file to exist, regardless of the type
+    function wait_for_file {
+      timeout 10 bash -c "while [ ! -e ${1} ]; do echo 'Waiting for ${1} to show up' && sleep 1 ; done"
+    }
+    
+    function is_available {
+      command -v $@ &>/dev/null
+    }
+    
+    function ceph_cmd_retry() {
+      cnt=0
+      until "ceph" "$@" || [ $cnt -ge 6 ]; do
+        sleep 10
+        ((cnt++))
+      done
+    }
+    
+    function crush_create_or_move {
+      local crush_location=${1}
+      ceph_cmd_retry --cluster "${CLUSTER}" --name="osd.${OSD_ID}" --keyring="${OSD_KEYRING}" \
+        osd crush create-or-move -- "${OSD_ID}" "${OSD_WEIGHT}" ${crush_location}
+    }
+    
+    function crush_add_and_move {
+      local crush_failure_domain_type=${1}
+      local crush_failure_domain_name=${2}
+      local crush_location=$(echo "root=default ${crush_failure_domain_type}=${crush_failure_domain_name} host=${HOSTNAME}")
+      crush_create_or_move "${crush_location}"
+      local crush_failure_domain_location_check=$(ceph_cmd_retry --cluster "${CLUSTER}" --name="osd.${OSD_ID}" --keyring="${OSD_KEYRING}" osd find ${OSD_ID} | grep "${crush_failure_domain_type}" | awk -F '"' '{print $4}')
+      if [ "x${crush_failure_domain_location_check}" != "x${crush_failure_domain_name}" ];  then
+        # NOTE(supamatt): Manually move the buckets for previously configured CRUSH configurations
+        # as create-or-move may not appropiately move them.
+        ceph_cmd_retry --cluster "${CLUSTER}" --name="osd.${OSD_ID}" --keyring="${OSD_KEYRING}" \
+          osd crush add-bucket "${crush_failure_domain_name}" "${crush_failure_domain_type}" || true
+        ceph_cmd_retry --cluster "${CLUSTER}" --name="osd.${OSD_ID}" --keyring="${OSD_KEYRING}" \
+          osd crush move "${crush_failure_domain_name}" root=default || true
+        ceph_cmd_retry --cluster "${CLUSTER}" --name="osd.${OSD_ID}" --keyring="${OSD_KEYRING}" \
+          osd crush move "${HOSTNAME}" "${crush_failure_domain_type}=${crush_failure_domain_name}" || true
+      fi
+    }
+    
+    function crush_location {
+      if [ "x${CRUSH_FAILURE_DOMAIN_TYPE}" != "xhost" ]; then
+        if [ "x${CRUSH_FAILURE_DOMAIN_NAME}" != "xfalse" ]; then
+          crush_add_and_move "${CRUSH_FAILURE_DOMAIN_TYPE}" "${CRUSH_FAILURE_DOMAIN_NAME}"
+        elif [ "x${CRUSH_FAILURE_DOMAIN_BY_HOSTNAME}" != "xfalse" ]; then
+          crush_add_and_move "${CRUSH_FAILURE_DOMAIN_TYPE}" "$(echo ${CRUSH_FAILURE_DOMAIN_TYPE}_$(echo ${HOSTNAME} | cut -c ${CRUSH_FAILURE_DOMAIN_BY_HOSTNAME}))"
+        else
+          # NOTE(supamatt): neither variables are defined then we fall back to default behavior
+          crush_create_or_move "${CRUSH_LOCATION}"
+        fi
+      else
+        crush_create_or_move "${CRUSH_LOCATION}"
+      fi
+    }
+    
+    # Calculate proper device names, given a device and partition number
+    function dev_part {
+      local osd_device=${1}
+      local osd_partition=${2}
+    
+      if [[ -L ${osd_device} ]]; then
+        # This device is a symlink. Work out it's actual device
+        local actual_device=$(readlink -f "${osd_device}")
+        local bn=$(basename "${osd_device}")
+        if [[ "${actual_device:0-1:1}" == [0-9] ]]; then
+          local desired_partition="${actual_device}p${osd_partition}"
+        else
+          local desired_partition="${actual_device}${osd_partition}"
+        fi
+        # Now search for a symlink in the directory of $osd_device
+        # that has the correct desired partition, and the longest
+        # shared prefix with the original symlink
+        local symdir=$(dirname "${osd_device}")
+        local link=""
+        local pfxlen=0
+        for option in ${symdir}/*; do
+          [[ -e $option ]] || break
+          if [[ $(readlink -f "${option}") == "${desired_partition}" ]]; then
+            local optprefixlen=$(prefix_length "${option}" "${bn}")
+            if [[ ${optprefixlen} > ${pfxlen} ]]; then
+              link=${symdir}/${option}
+              pfxlen=${optprefixlen}
+            fi
+          fi
+        done
+        if [[ $pfxlen -eq 0 ]]; then
+          >&2 echo "Could not locate appropriate symlink for partition ${osd_partition} of ${osd_device}"
+          exit 1
+        fi
+        echo "$link"
+      elif [[ "${osd_device:0-1:1}" == [0-9] ]]; then
+        echo "${osd_device}p${osd_partition}"
+      else
+        echo "${osd_device}${osd_partition}"
+      fi
+    }
+    
+    function zap_extra_partitions {
+      # Examine temp mount and delete any block.db and block.wal partitions
+      mountpoint=${1}
+      journal_disk=""
+      journal_part=""
+      block_db_disk=""
+      block_db_part=""
+      block_wal_disk=""
+      block_wal_part=""
+    
+      # Discover journal, block.db, and block.wal partitions first before deleting anything
+      # If the partitions are on the same disk, deleting one can affect discovery of the other(s)
+      if [ -L "${mountpoint}/journal" ]; then
+        journal_disk=$(readlink -m ${mountpoint}/journal | sed 's/[0-9]*//g')
+        journal_part=$(readlink -m ${mountpoint}/journal | sed 's/[^0-9]*//g')
+      fi
+      if [ -L "${mountpoint}/block.db" ]; then
+        block_db_disk=$(readlink -m ${mountpoint}/block.db | sed 's/[0-9]*//g')
+        block_db_part=$(readlink -m ${mountpoint}/block.db | sed 's/[^0-9]*//g')
+      fi
+      if [ -L "${mountpoint}/block.wal" ]; then
+        block_wal_disk=$(readlink -m ${mountpoint}/block.wal | sed 's/[0-9]*//g')
+        block_wal_part=$(readlink -m ${mountpoint}/block.wal | sed 's/[^0-9]*//g')
+      fi
+    
+      # Delete any discovered journal, block.db, and block.wal partitions
+      if [ ! -z "${journal_disk}" ]; then
+        sgdisk -d ${journal_part} ${journal_disk}
+        /sbin/udevadm settle --timeout=600
+        /usr/bin/flock -s ${journal_disk} /sbin/partprobe ${journal_disk}
+        /sbin/udevadm settle --timeout=600
+      fi
+      if [ ! -z "${block_db_disk}" ]; then
+        sgdisk -d ${block_db_part} ${block_db_disk}
+        /sbin/udevadm settle --timeout=600
+        /usr/bin/flock -s ${block_db_disk} /sbin/partprobe ${block_db_disk}
+        /sbin/udevadm settle --timeout=600
+      fi
+      if [ ! -z "${block_wal_disk}" ]; then
+        sgdisk -d ${block_wal_part} ${block_wal_disk}
+        /sbin/udevadm settle --timeout=600
+        /usr/bin/flock -s ${block_wal_disk} /sbin/partprobe ${block_wal_disk}
+        /sbin/udevadm settle --timeout=600
+      fi
+    }
+    
+    function disk_zap {
+      # Run all the commands that ceph-disk zap uses to clear a disk
+      local device=${1}
+      wipefs --all ${device}
+      # Wipe the first 200MB boundary, as Bluestore redeployments will not work otherwise
+      dd if=/dev/zero of=${device} bs=1M count=200
+      sgdisk --zap-all -- ${device}
+      sgdisk --clear --mbrtogpt -- ${device}
+    }
+    
+    function udev_settle {
+      partprobe "${OSD_DEVICE}"
+      if [ "${OSD_BLUESTORE:-0}" -eq 1 ]; then
+        if [ ! -z "$BLOCK_DB" ]; then
+          partprobe "${BLOCK_DB}"
+        fi
+        if [ ! -z "$BLOCK_WAL" ] && [ "$BLOCK_WAL" != "$BLOCK_DB" ]; then
+          partprobe "${BLOCK_WAL}"
+        fi
+      else
+        if [ "x$JOURNAL_TYPE" == "xblock-logical" ] && [ ! -z "$OSD_JOURNAL" ]; then
+          OSD_JOURNAL=$(readlink -f ${OSD_JOURNAL})
+          if [ ! -z "$OSD_JOURNAL" ]; then
+            local JDEV=$(echo ${OSD_JOURNAL} | sed 's/[0-9]//g')
+            partprobe "${JDEV}"
+          fi
+        fi
+      fi
+      # watch the udev event queue, and exit if all current events are handled
+      udevadm settle --timeout=600
+    
+      # On occassion udev may not make the correct device symlinks for Ceph, just in case we make them manually
+      mkdir -p /dev/disk/by-partuuid
+      for dev in $(awk '!/rbd/{print $4}' /proc/partitions | grep "[0-9]"); do
+        diskdev=$(echo "${dev//[!a-z]/}")
+        partnum=$(echo "${dev//[!0-9]/}")
+        ln -s "../../${dev}" "/dev/disk/by-partuuid/$(sgdisk -i ${partnum} /dev/${diskdev} | awk '/Partition unique GUID/{print tolower($4)}')" || true
+      done
+    }
+    
+    
+  osd-block-ceph-volume.sh: |
+    #!/bin/bash
+    
+    
+    
+    source /tmp/osd-common-ceph-volume.sh
+    
+    set -ex
+    
+    : "${OSD_SOFT_FORCE_ZAP:=1}"
+    : "${OSD_JOURNAL_DISK:=}"
+    
+    if [ "x${STORAGE_TYPE%-*}" == "xdirectory" ]; then
+      export OSD_DEVICE="/var/lib/ceph/osd"
+    else
+      export OSD_DEVICE=$(readlink -f ${STORAGE_LOCATION})
+    fi
+    
+    if [ "x$JOURNAL_TYPE" == "xdirectory" ]; then
+      export OSD_JOURNAL="/var/lib/ceph/journal"
+    else
+      export OSD_JOURNAL=$(readlink -f ${JOURNAL_LOCATION})
+    fi
+    
+    if [[ -z "${OSD_DEVICE}" ]];then
+      echo "ERROR- You must provide a device to build your OSD ie: /dev/sdb"
+      exit 1
+    fi
+    
+    if [[ ! -b "${OSD_DEVICE}" ]]; then
+      echo "ERROR- The device pointed by OSD_DEVICE ${OSD_DEVICE} doesn't exist !"
+      exit 1
+    fi
+    
+    CEPH_DISK_OPTIONS=""
+    CEPH_OSD_OPTIONS=""
+    
+    udev_settle
+    
+    OSD_ID=$(ceph-volume inventory ${OSD_DEVICE} | grep "osd id" | awk '{print $3}')
+    simple_activate=0
+    if [[ -z ${OSD_ID} ]]; then
+      echo "Looks like ceph-disk has been used earlier to activate the OSD."
+      tmpmnt=$(mktemp -d)
+      mount ${OSD_DEVICE}1 ${tmpmnt}
+      OSD_ID=$(cat ${tmpmnt}/whoami)
+      umount ${tmpmnt}
+      simple_activate=1
+    fi
+    OSD_FSID=$(ceph-volume inventory ${OSD_DEVICE} | grep "osd fsid" | awk '{print $3}')
+    if [[ -z ${OSD_FSID} ]]; then
+      echo "Looks like ceph-disk has been used earlier to activate the OSD."
+      tmpmnt=$(mktemp -d)
+      mount ${OSD_DEVICE}1 ${tmpmnt}
+      OSD_FSID=$(cat ${tmpmnt}/fsid)
+      umount ${tmpmnt}
+      simple_activate=1
+    fi
+    OSD_PATH="${OSD_PATH_BASE}-${OSD_ID}"
+    OSD_KEYRING="${OSD_PATH}/keyring"
+    
+    mkdir -p ${OSD_PATH}
+    
+    if [[ ${simple_activate} -eq 1 ]]; then
+      ceph-volume simple activate --no-systemd ${OSD_ID} ${OSD_FSID}
+    else
+      ceph-volume lvm -v \
+        --setuser ceph \
+        --setgroup disk \
+        activate ${CEPH_DISK_OPTIONS} \
+        --auto-detect-objectstore \
+        --no-systemd ${OSD_ID} ${OSD_FSID}
+    fi
+    
+    # NOTE(supamatt): set the initial crush weight of the OSD to 0 to prevent automatic rebalancing
+    OSD_WEIGHT=0
+    # NOTE(supamatt): add or move the OSD's CRUSH location
+    crush_location
+    
+    if [ "${OSD_BLUESTORE:-0}" -ne 1 ]; then
+      if [ -n "${OSD_JOURNAL}" ]; then
+        if [ -b "${OSD_JOURNAL}" ]; then
+          OSD_JOURNAL_DISK="$(readlink -f ${OSD_PATH}/journal)"
+          if [ -z "${OSD_JOURNAL_DISK}" ]; then
+            echo "ERROR: Unable to find journal device ${OSD_JOURNAL_DISK}"
+            exit 1
+          else
+            OSD_JOURNAL="${OSD_JOURNAL_DISK}"
+            if [ -e "${OSD_PATH}/run_mkjournal" ]; then
+              ceph-osd -i ${OSD_ID} --mkjournal
+              rm -rf ${OSD_PATH}/run_mkjournal
+            fi
+          fi
+        fi
+        if [ "x${JOURNAL_TYPE}" == "xdirectory" ]; then
+          OSD_JOURNAL="${OSD_JOURNAL}/journal.${OSD_ID}"
+          touch ${OSD_JOURNAL}
+          wait_for_file "${OSD_JOURNAL}"
+        else
+          if [ ! -b "${OSD_JOURNAL}" ]; then
+            echo "ERROR: Unable to find journal device ${OSD_JOURNAL}"
+            exit 1
+          else
+            chown ceph. "${OSD_JOURNAL}"
+          fi
+        fi
+      else
+        wait_for_file "${OSD_JOURNAL}"
+        chown ceph. "${OSD_JOURNAL}"
+      fi
+    fi
+    
+    # NOTE(supamatt): Just in case permissions do not align up, we recursively set them correctly.
+    if [ $(stat -c%U ${OSD_PATH}) != ceph ]; then
+      chown -R ceph. ${OSD_PATH};
+    fi
+    
+    # NOTE(gagehugo): Writing the OSD_ID to tmp for logging
+    echo "${OSD_ID}" > /tmp/osd-id
+    
+    if [ "x${JOURNAL_TYPE}" == "xdirectory" ]; then
+      chown -R ceph. /var/lib/ceph/journal
+      ceph-osd \
+        --cluster ceph \
+        --osd-data ${OSD_PATH} \
+        --osd-journal ${OSD_JOURNAL} \
+        -f \
+        -i ${OSD_ID} \
+        --setuser ceph \
+        --setgroup disk \
+        --mkjournal
+    fi
+    
+    exec /usr/bin/ceph-osd \
+        --cluster ${CLUSTER} \
+        ${CEPH_OSD_OPTIONS} \
+        -f \
+        -i ${OSD_ID} \
+        --setuser ceph \
+        --setgroup disk & echo $! > /run/ceph-osd.pid
+    wait
+    
+  osd-bluestore-ceph-volume.sh: |
+    #!/bin/bash
+    
+    
+    
+    source /tmp/osd-common-ceph-volume.sh
+    
+    set -ex
+    
+    : "${OSD_SOFT_FORCE_ZAP:=1}"
+    
+    export OSD_DEVICE=$(readlink -f ${STORAGE_LOCATION})
+    
+    if [[ -z "${OSD_DEVICE}" ]];then
+      echo "ERROR- You must provide a device to build your OSD ie: /dev/sdb"
+      exit 1
+    fi
+    
+    if [[ ! -b "${OSD_DEVICE}" ]]; then
+      echo "ERROR- The device pointed by OSD_DEVICE ${OSD_DEVICE} doesn't exist !"
+      exit 1
+    fi
+    
+    CEPH_DISK_OPTIONS=""
+    CEPH_OSD_OPTIONS=""
+    
+    udev_settle
+    
+    OSD_ID=$(get_osd_id_from_device ${OSD_DEVICE})
+    simple_activate=0
+    if [[ -z ${OSD_ID} ]]; then
+      echo "Looks like ceph-disk has been used earlier to activate the OSD."
+      tmpmnt=$(mktemp -d)
+      mount ${OSD_DEVICE}1 ${tmpmnt}
+      OSD_ID=$(cat ${tmpmnt}/whoami)
+      umount ${tmpmnt}
+      simple_activate=1
+    fi
+    OSD_FSID=$(get_osd_fsid_from_device ${OSD_DEVICE})
+    if [[ -z ${OSD_FSID} ]]; then
+      echo "Looks like ceph-disk has been used earlier to activate the OSD."
+      tmpmnt=$(mktemp -d)
+      mount ${OSD_DEVICE}1 ${tmpmnt}
+      OSD_FSID=$(cat ${tmpmnt}/fsid)
+      umount ${tmpmnt}
+      simple_activate=1
+    fi
+    OSD_PATH="${OSD_PATH_BASE}-${OSD_ID}"
+    OSD_KEYRING="${OSD_PATH}/keyring"
+    
+    mkdir -p ${OSD_PATH}
+    
+    if [[ ${simple_activate} -eq 1 ]]; then
+      ceph-volume simple activate --no-systemd ${OSD_ID} ${OSD_FSID}
+    else
+      ceph-volume lvm -v \
+        --setuser ceph \
+        --setgroup disk \
+        activate ${CEPH_DISK_OPTIONS} \
+        --auto-detect-objectstore \
+        --no-systemd ${OSD_ID} ${OSD_FSID}
+      # Cross check the db and wal symlinks if missed
+      DB_DEV=$(get_osd_db_device_from_device ${OSD_DEVICE})
+      if [[ ! -z ${DB_DEV} ]]; then
+        if [[ ! -h /var/lib/ceph/osd/ceph-${OSD_ID}/block.db ]]; then
+          ln -snf ${DB_DEV} /var/lib/ceph/osd/ceph-${OSD_ID}/block.db
+          chown -h ceph:ceph ${DB_DEV}
+          chown -h ceph:ceph /var/lib/ceph/osd/ceph-${OSD_ID}/block.db
+        fi
+      fi
+      WAL_DEV=$(get_osd_wal_device_from_device ${OSD_DEVICE})
+      if [[ ! -z ${WAL_DEV} ]]; then
+        if [[ ! -h /var/lib/ceph/osd/ceph-${OSD_ID}/block.wal ]]; then
+          ln -snf ${WAL_DEV} /var/lib/ceph/osd/ceph-${OSD_ID}/block.wal
+          chown -h ceph:ceph ${WAL_DEV}
+          chown -h ceph:ceph /var/lib/ceph/osd/ceph-${OSD_ID}/block.wal
+        fi
+      fi
+    fi
+    
+    # NOTE(supamatt): set the initial crush weight of the OSD to 0 to prevent automatic rebalancing
+    OSD_WEIGHT=0
+    # NOTE(supamatt): add or move the OSD's CRUSH location
+    crush_location
+    
+    
+    # NOTE(supamatt): Just in case permissions do not align up, we recursively set them correctly.
+    if [ $(stat -c%U ${OSD_PATH}) != ceph ]; then
+      chown -R ceph. ${OSD_PATH};
+    fi
+    
+    # NOTE(gagehugo): Writing the OSD_ID to tmp for logging
+    echo "${OSD_ID}" > /tmp/osd-id
+    
+    exec /usr/bin/ceph-osd \
+        --cluster ${CLUSTER} \
+        ${CEPH_OSD_OPTIONS} \
+        -f \
+        -i ${OSD_ID} \
+        --setuser ceph \
+        --setgroup disk & echo $! > /run/ceph-osd.pid
+    wait
+    
+  osd-init-ceph-volume.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    source /tmp/osd-common-ceph-volume.sh
+    
+    : "${OSD_FORCE_REPAIR:=1}"
+    # We do not want to zap journal disk. Tracking this option seperatly.
+    : "${JOURNAL_FORCE_ZAP:=0}"
+    
+    if [ "x${STORAGE_TYPE%-*}" == "xbluestore" ]; then
+      export OSD_BLUESTORE=1
+    fi
+    
+    if [ "x${STORAGE_TYPE%-*}" == "xdirectory" ]; then
+      export OSD_DEVICE="/var/lib/ceph/osd"
+    else
+      export OSD_DEVICE=$(readlink -f ${STORAGE_LOCATION})
+    fi
+    
+    if [ "x$JOURNAL_TYPE" == "xdirectory" ]; then
+      export OSD_JOURNAL="/var/lib/ceph/journal"
+    else
+      export OSD_JOURNAL=$(readlink -f ${JOURNAL_LOCATION})
+    fi
+    
+    function osd_disk_prepare {
+      if [[ -z "${OSD_DEVICE}" ]];then
+        echo "ERROR- You must provide a device to build your OSD ie: /dev/sdb"
+        exit 1
+      fi
+    
+      if [[ ! -b "${OSD_DEVICE}" ]]; then
+        echo "ERROR- The device pointed by OSD_DEVICE ($OSD_DEVICE) doesn't exist !"
+        exit 1
+      fi
+    
+      if [ ! -e $OSD_BOOTSTRAP_KEYRING ]; then
+        echo "ERROR- $OSD_BOOTSTRAP_KEYRING must exist. You can extract it from your current monitor by running 'ceph auth get client.bootstrap-osd -o $OSD_BOOTSTRAP_KEYRING'"
+        exit 1
+      fi
+      timeout 10 ceph ${CLI_OPTS} --name client.bootstrap-osd --keyring $OSD_BOOTSTRAP_KEYRING health || exit 1
+    
+      #search for some ceph metadata on the disk based on the status of the disk/lvm in filestore
+      CEPH_DISK_USED=0
+      CEPH_LVM_PREPARE=1
+      osd_dev_string=$(echo ${OSD_DEVICE} | awk -F "/" '{print $2}{print $3}' | paste -s -d'-')
+      udev_settle
+      OSD_ID=$(get_osd_id_from_device ${OSD_DEVICE})
+      if [ "${OSD_BLUESTORE:-0}" -ne 1 ]; then
+        if [[ ! -z ${OSD_ID} ]]; then
+          DM_NUM=$(dmsetup ls | grep $(lsblk -J ${OSD_DEVICE} | jq -r '.blockdevices[].children[].name') | awk '{print $2}' | cut -d':' -f2 | cut -d')' -f1)
+          DM_DEV="/dev/dm-"${DM_NUM}
+        elif [[ $(sgdisk --print ${OSD_DEVICE} | grep "F800") ]]; then
+          DM_DEV=${OSD_DEVICE}$(sgdisk --print ${OSD_DEVICE} | grep "F800" | awk '{print $1}')
+          CEPH_DISK_USED=1
+        else
+          if [[ ${OSD_FORCE_REPAIR} -eq 1 ]]; then
+            echo "It looks like ${OSD_DEVICE} isn't consistent, however OSD_FORCE_REPAIR is enabled so we are zapping the device anyway"
+            disk_zap ${OSD_DEVICE}
+          else
+            echo "Regarding parted, device ${OSD_DEVICE} is inconsistent/broken/weird."
+            echo "It would be too dangerous to destroy it without any notification."
+            echo "Please set OSD_FORCE_REPAIR to '1' if you really want to zap this disk."
+            exit 1
+          fi
+        fi
+      else
+        if [[ ! -z ${OSD_ID} ]]; then
+          if ceph --name client.bootstrap-osd --keyring $OSD_BOOTSTRAP_KEYRING osd ls |grep -w ${OSD_ID}; then
+            echo "Running bluestore mode and ${OSD_DEVICE} already bootstrapped"
+          else
+            echo "found the wrong osd id which does not belong to current ceph cluster"
+            exit 1
+          fi
+        elif [[ $(sgdisk --print ${OSD_DEVICE} | grep "F800") ]]; then
+          DM_DEV=${OSD_DEVICE}$(sgdisk --print ${OSD_DEVICE} | grep "F800" | awk '{print $1}')
+          CEPH_DISK_USED=1
+        else
+          osd_dev_split=$(basename ${OSD_DEVICE})
+          if dmsetup ls |grep -i ${osd_dev_split}|grep -v "db--wal"; then
+            CEPH_DISK_USED=1
+          fi
+          if [[ ${OSD_FORCE_REPAIR} -eq 1 ]] && [ ${CEPH_DISK_USED} -ne 1 ]; then
+            echo "It looks like ${OSD_DEVICE} isn't consistent, however OSD_FORCE_REPAIR is enabled so we are zapping the device anyway"
+            disk_zap ${OSD_DEVICE}
+          else
+            echo "Regarding parted, device ${OSD_DEVICE} is inconsistent/broken/weird."
+            echo "It would be too dangerous to destroy it without any notification."
+            echo "Please set OSD_FORCE_REPAIR to '1' if you really want to zap this disk."
+            exit 1
+          fi
+        fi
+      fi
+      if [ ${OSD_FORCE_REPAIR} -eq 1 ] && [ ! -z ${DM_DEV} ]; then
+        if [ -b $DM_DEV ]; then
+          local cephFSID=$(ceph-conf --lookup fsid)
+          if [ ! -z "${cephFSID}"  ]; then
+            local tmpmnt=$(mktemp -d)
+            mount ${DM_DEV} ${tmpmnt}
+            if [ "${OSD_BLUESTORE:-0}" -ne 1 ] && [ "x$JOURNAL_TYPE" != "xdirectory" ]; then
+              # we only care about journals for filestore.
+              if [  -f "${tmpmnt}/whoami" ]; then
+                OSD_JOURNAL_DISK=$(readlink -f "${tmpmnt}/journal")
+                local osd_id=$(cat "${tmpmnt}/whoami")
+                if [ ! -b "${OSD_JOURNAL_DISK}" ]; then
+                  OSD_JOURNAL=$(readlink -f ${OSD_JOURNAL})
+                  local jdev=$(echo ${OSD_JOURNAL} | sed 's/[0-9]//g')
+                  if [ ${jdev} == ${OSD_JOURNAL} ]; then
+                    echo "It appears that ${OSD_DEVICE} is missing the journal at ${OSD_JOURNAL}."
+                    echo "Because OSD_FORCE_REPAIR is set, we will wipe the metadata of the OSD and zap it."
+                    rm -rf ${tmpmnt}/ceph_fsid
+                  else
+                    echo "It appears that ${OSD_DEVICE} is missing the journal at ${OSD_JOURNAL_DISK}."
+                    echo "Because OSD_FORCE_REPAIR is set and paritions are manually defined, we will"
+                    echo "attempt to recreate the missing journal device partitions."
+                    osd_journal_create ${OSD_JOURNAL}
+                    ln -sf /dev/disk/by-partuuid/${OSD_JOURNAL_UUID} ${tmpmnt}/journal
+                    echo ${OSD_JOURNAL_UUID} | tee ${tmpmnt}/journal_uuid
+                    chown ceph. ${OSD_JOURNAL}
+                    # During OSD start we will format the journal and set the fsid
+                    touch ${tmpmnt}/run_mkjournal
+                  fi
+                fi
+              else
+                echo "It looks like ${OSD_DEVICE} has a ceph data partition but is missing it's metadata."
+                echo "The device may contain inconsistent metadata or be corrupted."
+                echo "Because OSD_FORCE_REPAIR is set, we will wipe the metadata of the OSD and zap it."
+                rm -rf ${tmpmnt}/ceph_fsid
+              fi
+            fi
+            if [ -f "${tmpmnt}/ceph_fsid" ]; then
+              osdFSID=$(cat "${tmpmnt}/ceph_fsid")
+              if [ ${osdFSID} != ${cephFSID} ]; then
+                echo "It looks like ${OSD_DEVICE} is an OSD belonging to a different (or old) ceph cluster."
+                echo "The OSD FSID is ${osdFSID} while this cluster is ${cephFSID}"
+                echo "Because OSD_FORCE_REPAIR was set, we will zap this device."
+                zap_extra_partitions ${tmpmnt}
+                umount ${tmpmnt}
+                disk_zap ${OSD_DEVICE}
+              else
+                umount ${tmpmnt}
+                echo "It looks like ${OSD_DEVICE} is an OSD belonging to a this ceph cluster."
+                echo "OSD_FORCE_REPAIR is set, but will be ignored and the device will not be zapped."
+                echo "Moving on, trying to activate the OSD now."
+              fi
+            else
+              echo "It looks like ${OSD_DEVICE} has a ceph data partition but no FSID."
+              echo "Because OSD_FORCE_REPAIR was set, we will zap this device."
+              zap_extra_partitions ${tmpmnt}
+              umount ${tmpmnt}
+              disk_zap ${OSD_DEVICE}
+            fi
+          else
+            echo "Unable to determine the FSID of the current cluster."
+            echo "OSD_FORCE_REPAIR is set, but this OSD will not be zapped."
+            echo "Moving on, trying to activate the OSD now."
+            return
+          fi
+        else
+          echo "parted says ${DM_DEV} should exist, but we do not see it."
+          echo "We will ignore OSD_FORCE_REPAIR and try to use the device as-is"
+          echo "Moving on, trying to activate the OSD now."
+          return
+        fi
+      else
+        echo "INFO- It looks like ${OSD_DEVICE} is an OSD LVM"
+        echo "Moving on, trying to prepare and activate the OSD LVM now."
+      fi
+    
+      if [ "${OSD_BLUESTORE:-0}" -eq 1 ] && [ ${CEPH_DISK_USED} -eq 0 ] ; then
+        if [[ ${BLOCK_DB} ]]; then
+          block_db_string=$(echo ${BLOCK_DB} | awk -F "/" '{print $2}{print $3}' | paste -s -d'-')
+        fi
+        if [[ ${BLOCK_WAL} ]]; then
+          block_wal_string=$(echo ${BLOCK_WAL} | awk -F "/" '{print $2}{print $3}' | paste -s -d'-')
+        fi
+        exec {lock_fd}>/var/lib/ceph/tmp/init-osd.lock || exit 1
+        flock -w 600 --verbose "${lock_fd}"
+        if [[ ${BLOCK_DB} && ${BLOCK_WAL} ]]; then
+           if [[ ${block_db_string} == ${block_wal_string} ]]; then
+             if [[ $(vgdisplay  | grep "VG Name" | awk '{print $3}' | grep "${block_db_string}") ]]; then
+               VG=$(vgdisplay  | grep "VG Name" | awk '{print $3}' | grep "${block_db_string}")
+               WAL_OSD_ID=$(get_osd_id_from_volume /dev/ceph-db-wal-${block_wal_string}/ceph-wal-${osd_dev_string})
+               DB_OSD_ID=$(get_osd_id_from_volume /dev/ceph-db-wal-${block_db_string}/ceph-db-${osd_dev_string})
+               if [ ! -z ${OSD_ID} ] && ([ ${WAL_OSD_ID} != ${OSD_ID} ] || [ ${DB_OSD_ID} != ${OSD_ID} ]); then
+                 echo "Found VG, but corresponding DB || WAL are not, zapping the ${OSD_DEVICE}"
+                 disk_zap ${OSD_DEVICE}
+                 CEPH_LVM_PREPARE=1
+               elif [ ! -z ${OSD_ID} ] && ([ -z ${WAL_OSD_ID} ] || [ -z ${DB_OSD_ID} ]); then
+                 disk_zap ${OSD_DEVICE}
+                 CEPH_LVM_PREPARE=1
+               elif [ -z ${OSD_ID} ]; then
+                 CEPH_LVM_PREPARE=1
+               else
+                 CEPH_LVM_PREPARE=0
+               fi
+             else
+               osd_dev_split=$(echo ${OSD_DEVICE} | awk -F "/" '{print $3}')
+               if [[ ! -z $(lsblk ${BLOCK_DB} -o name,type -l | grep "lvm" | grep "ceph"| awk '{print $1}' | grep ${osd_dev_split}) ]]; then
+                 echo "dmsetup reference found but disks mismatch, removing all dmsetup references for ${BLOCK_DB}"
+                 for item in $(lsblk ${BLOCK_DB} -o name,type -l | grep "lvm" | grep "ceph"| awk '{print $1}');
+                 do
+                   dmsetup remove ${item}
+                 done
+                 disk_zap ${OSD_DEVICE}
+                 CEPH_LVM_PREPARE=1
+               fi
+               vgcreate ceph-db-wal-${block_db_string} ${BLOCK_DB}
+               VG=ceph-db-wal-${block_db_string}
+             fi
+             if [[ $(lvdisplay  | grep "LV Name" | awk '{print $3}' | grep "ceph-db-${osd_dev_string}") != "ceph-db-${osd_dev_string}" ]]; then
+               lvcreate -L ${BLOCK_DB_SIZE} -n ceph-db-${osd_dev_string} ${VG}
+             fi
+             BLOCK_DB=${VG}/ceph-db-${osd_dev_string}
+             if [[ $(lvdisplay  | grep "LV Name" | awk '{print $3}' | grep "ceph-wal-${osd_dev_string}") != "ceph-wal-${osd_dev_string}" ]]; then
+               lvcreate -L ${BLOCK_WAL_SIZE} -n ceph-wal-${osd_dev_string} ${VG}
+             fi
+             BLOCK_WAL=${VG}/ceph-wal-${osd_dev_string}
+           else
+             if [[ $(vgdisplay  | grep "VG Name" | awk '{print $3}' | grep "${block_db_string}") ]]; then
+               VG=$(vgdisplay  | grep "VG Name" | awk '{print $3}' | grep "${block_db_string}")
+               DB_OSD_ID=$(get_osd_id_from_volume /dev/ceph-db-wal-${block_db_string}/ceph-db-${block_db_string})
+               if [ ! -z ${OSD_ID} ] && [ ${DB_OSD_ID} != ${OSD_ID} ]; then
+                 echo "Found VG, but corresponding DB is not, zapping the ${OSD_DEVICE}"
+                 disk_zap ${OSD_DEVICE}
+                 CEPH_LVM_PREPARE=1
+               elif [ ! -z ${OSD_ID} ] && [ -z ${DB_OSD_ID} ]; then
+                 disk_zap ${OSD_DEVICE}
+                 CEPH_LVM_PREPARE=1
+               elif [ -z ${OSD_ID} ]; then
+                 CEPH_LVM_PREPARE=1
+               else
+                 CEPH_LVM_PREPARE=0
+               fi
+             else
+               osd_dev_split=$(echo ${OSD_DEVICE} | awk -F "/" '{print $3}')
+               if [[ ! -z $(lsblk ${BLOCK_DB} -o name,type -l | grep "lvm" | grep "ceph"| awk '{print $1}' | grep ${osd_dev_split}) ]]; then
+                 echo "dmsetup reference found but disks mismatch"
+                 dmsetup remove $(lsblk ${BLOCK_DB} -o name,type -l | grep "lvm" | grep "ceph"| awk '{print $1}' | grep ${osd_dev_split})
+                 disk_zap ${OSD_DEVICE}
+                 CEPH_LVM_PREPARE=1
+               fi
+               vgcreate ceph-db-wal-${block_db_string} ${BLOCK_DB}
+               VG=ceph-db-wal-${block_db_string}
+             fi
+             if [[ $(vgdisplay  | grep "VG Name" | awk '{print $3}' | grep "${block_wal_string}") ]]; then
+               VG=$(vgdisplay  | grep "VG Name" | awk '{print $3}' | grep "${block_wal_string}")
+               WAL_OSD_ID=$(get_osd_id_from_volume /dev/ceph-db-wal-${block_wal_string}/ceph-wal-${block_wal_string})
+               if [ ! -z ${OSD_ID} ] && [ ${WAL_OSD_ID} != ${OSD_ID} ]; then
+                 echo "Found VG, but corresponding WAL is not, zapping the ${OSD_DEVICE}"
+                 disk_zap ${OSD_DEVICE}
+                 CEPH_LVM_PREPARE=1
+               elif [ ! -z ${OSD_ID} ] && [ -z ${WAL_OSD_ID} ]; then
+                 disk_zap ${OSD_DEVICE}
+                 CEPH_LVM_PREPARE=1
+               elif [ -z ${OSD_ID} ]; then
+                 CEPH_LVM_PREPARE=1
+               else
+                 CEPH_LVM_PREPARE=0
+               fi
+             else
+               osd_dev_split=$(echo ${OSD_DEVICE} | awk -F "/" '{print $3}')
+               if [[ ! -z $(lsblk ${BLOCK_WAL} -o name,type -l | grep "lvm" | grep "ceph"| awk '{print $1}' | grep ${osd_dev_split}) ]]; then
+                 echo "dmsetup reference found but disks mismatch"
+                 dmsetup remove $(lsblk ${BLOCK_WAL} -o name,type -l | grep "lvm" | grep "ceph"| awk '{print $1}' | grep ${osd_dev_split})
+                 disk_zap ${OSD_DEVICE}
+                 CEPH_LVM_PREPARE=1
+               fi
+               vgcreate ceph-db-wal-${block_wal_string} ${BLOCK_WAL}
+               VG=ceph-db-wal-${block_wal_string}
+             fi
+             if [[ $(lvdisplay  | grep "LV Name" | awk '{print $3}' | grep "ceph-db-${block_db_string}") != "ceph-db-${block_db_string}" ]]; then
+               lvcreate -L ${BLOCK_DB_SIZE} -n ceph-db-${block_db_string} ${VG}
+             fi
+             BLOCK_DB=${VG}/ceph-db-${block_db_string}
+             if [[ $(lvdisplay  | grep "LV Name" | awk '{print $3}' | grep "ceph-db-${block_wal_string}") != "ceph-db-${block_wal_string}" ]]; then
+               lvcreate -L ${BLOCK_WAL_SIZE} -n ceph-wal-${block_wal_string} ${VG}
+             fi
+             BLOCK_WAL=${VG}/ceph-wal-${block_wal_string}
+           fi
+        elif [[ -z ${BLOCK_DB} && ${BLOCK_WAL} ]]; then
+           if [[ $(vgdisplay  | grep "VG Name" | awk '{print $3}' | grep "${block_wal_string}") ]]; then
+             VG=$(vgdisplay  | grep "VG Name" | awk '{print $3}' | grep "${block_wal_string}")
+             WAL_OSD_ID=$(get_osd_id_from_volume /dev/ceph-wal-${block_wal_string}/ceph-wal-${osd_dev_string})
+             if [ ! -z ${OSD_ID} ] && [ ${WAL_OSD_ID} != ${OSD_ID} ]; then
+               echo "Found VG, but corresponding WAL is not, zapping the ${OSD_DEVICE}"
+               disk_zap ${OSD_DEVICE}
+               CEPH_LVM_PREPARE=1
+             elif [ ! -z ${OSD_ID} ] && [ -z ${WAL_OSD_ID} ]; then
+               disk_zap ${OSD_DEVICE}
+               CEPH_LVM_PREPARE=1
+             elif [ -z ${OSD_ID} ]; then
+               CEPH_LVM_PREPARE=1
+             else
+               CEPH_LVM_PREPARE=0
+             fi
+           else
+             osd_dev_split=$(echo ${OSD_DEVICE} | awk -F "/" '{print $3}')
+             if [[ ! -z $(lsblk ${BLOCK_WAL} -o name,type -l | grep "lvm" | grep "ceph"| awk '{print $1}' | grep ${osd_dev_split}) ]]; then
+               echo "dmsetup reference found but disks mismatch"
+               dmsetup remove $(lsblk ${BLOCK_WAL} -o name,type -l | grep "lvm" | grep "ceph"| awk '{print $1}' | grep ${osd_dev_split})
+               disk_zap ${OSD_DEVICE}
+               CEPH_LVM_PREPARE=1
+             fi
+             vgcreate ceph-wal-${block_wal_string} ${BLOCK_WAL}
+             VG=ceph-wal-${block_wal_string}
+           fi
+           if [[ $(lvdisplay  | grep "LV Name" | awk '{print $3}' | grep "ceph-wal-${osd_dev_string}") != "ceph-wal-${osd_dev_string}" ]]; then
+             lvcreate -L ${BLOCK_WAL_SIZE} -n ceph-wal-${osd_dev_string} ${VG}
+           fi
+           BLOCK_WAL=${VG}/ceph-wal-${osd_dev_string}
+        elif [[ ${BLOCK_DB} && -z ${BLOCK_WAL} ]]; then
+           if [[ $(vgdisplay  | grep "VG Name" | awk '{print $3}' | grep "${block_db_string}") ]]; then
+             VG=$(vgdisplay  | grep "VG Name" | awk '{print $3}' | grep "${block_db_string}")
+             DB_OSD_ID=$(get_osd_id_from_volume /dev/ceph-db-${block_db_string}/ceph-db-${osd_dev_string})
+             if [ ! -z ${OSD_ID} ] && [ ${DB_OSD_ID} != ${OSD_ID} ]; then
+               echo "Found VG, but corresponding DB is not, zapping the ${OSD_DEVICE}"
+               disk_zap ${OSD_DEVICE}
+               CEPH_LVM_PREPARE=1
+             elif [ ! -z ${OSD_ID} ] && [ -z ${DB_OSD_ID} ]; then
+               disk_zap ${OSD_DEVICE}
+               CEPH_LVM_PREPARE=1
+             elif [ -z ${OSD_ID} ]; then
+               CEPH_LVM_PREPARE=1
+             else
+               CEPH_LVM_PREPARE=0
+             fi
+           else
+             osd_dev_split=$(echo ${OSD_DEVICE} | awk -F "/" '{print $3}')
+             if [[ ! -z $(lsblk ${BLOCK_DB} -o name,type -l | grep "lvm" | grep "ceph"| awk '{print $1}' | grep ${osd_dev_split}) ]]; then
+               echo "dmsetup reference found but disks mismatch"
+               dmsetup remove $(lsblk ${BLOCK_WAL} -o name,type -l | grep "lvm" | grep "ceph"| awk '{print $1}' | grep ${osd_dev_split})
+               disk_zap ${OSD_DEVICE}
+               CEPH_LVM_PREPARE=1
+             fi
+             vgcreate ceph-db-${block_db_string} ${BLOCK_DB}
+             VG=ceph-db-${block_db_string}
+           fi
+           if [[ $(lvdisplay  | grep "LV Name" | awk '{print $3}' | grep "ceph-db-${osd_dev_string}") != "ceph-db-${osd_dev_string}" ]]; then
+             lvcreate -L ${BLOCK_DB_SIZE} -n ceph-db-${osd_dev_string} ${VG}
+           fi
+           BLOCK_DB=${VG}/ceph-db-${osd_dev_string}
+        fi
+        flock -u "${lock_fd}"
+        if [ -z ${BLOCK_DB} ] && [ -z ${BLOCK_WAL} ]; then
+          if pvdisplay ${OSD_DEVICE} | grep "VG Name" | awk '{print $3}' | grep "ceph"; then
+            CEPH_LVM_PREPARE=0
+          fi
+        fi
+      else
+        if pvdisplay ${OSD_DEVICE} | grep "VG Name" | awk '{print $3}' | grep "ceph"; then
+          CEPH_LVM_PREPARE=0
+        fi
+      fi
+    
+      if [ "${OSD_BLUESTORE:-0}" -eq 1 ]; then
+        CLI_OPTS="${CLI_OPTS} --bluestore"
+    
+        if [ ! -z "$BLOCK_DB" ]; then
+          CLI_OPTS="${CLI_OPTS} --block.db ${BLOCK_DB}"
+        fi
+    
+        if [ ! -z "$BLOCK_WAL" ]; then
+          CLI_OPTS="${CLI_OPTS} --block.wal ${BLOCK_WAL}"
+        fi
+      else
+        # we only care about journals for filestore.
+        osd_journal_prepare
+        CLI_OPTS="${CLI_OPTS} --data ${OSD_DEVICE} --journal ${OSD_JOURNAL}"
+        udev_settle
+      fi
+      if [[ ${CEPH_DISK_USED} -eq 1 ]]; then
+        CLI_OPTS="${CLI_OPTS} --data ${OSD_DEVICE}"
+        ceph-volume simple scan --force ${OSD_DEVICE}$(sgdisk --print ${OSD_DEVICE} | grep "F800" | awk '{print $1}')
+      elif [[ ${CEPH_LVM_PREPARE} == 1 ]]; then
+        if [[ $(vgdisplay  | grep "VG Name" | awk '{print $3}' | grep "ceph-vg-${osd_dev_string}") ]]; then
+          OSD_VG=$(vgdisplay  | grep "VG Name" | awk '{print $3}' | grep "ceph-vg-${osd_dev_string}")
+        else
+          vgcreate ceph-vg-${osd_dev_string} ${OSD_DEVICE}
+          OSD_VG=ceph-vg-${osd_dev_string}
+        fi
+        if [[ $(lvdisplay  | grep "LV Name" | awk '{print $3}' | grep "ceph-lv-${osd_dev_string}") != "ceph-lv-${osd_dev_string}" ]]; then
+          lvcreate --yes -l 100%FREE -n ceph-lv-${osd_dev_string} ${OSD_VG}
+        fi
+        OSD_LV=${OSD_VG}/ceph-lv-${osd_dev_string}
+        CLI_OPTS="${CLI_OPTS} --data ${OSD_LV}"
+        ceph-volume lvm -v prepare ${CLI_OPTS}
+      fi
+    }
+    
+    function osd_journal_create {
+      local osd_journal=${1}
+      local osd_journal_partition=$(echo ${osd_journal} | sed 's/[^0-9]//g')
+      local jdev=$(echo ${osd_journal} | sed 's/[0-9]//g')
+      if [ -b "${jdev}" ]; then
+        sgdisk --new=${osd_journal_partition}:0:+${OSD_JOURNAL_SIZE}M \
+          --change-name='${osd_journal_partition}:ceph journal' \
+          --partition-guid=${osd_journal_partition}:${OSD_JOURNAL_UUID} \
+          --typecode=${osd_journal_partition}:45b0969e-9b03-4f30-b4c6-b4b80ceff106 --mbrtogpt -- ${jdev}
+        OSD_JOURNAL=$(dev_part ${jdev} ${osd_journal_partition})
+        udev_settle
+      else
+        echo "The backing device ${jdev} for ${OSD_JOURNAL} does not exist on this system."
+        exit 1
+      fi
+    }
+    
+    function osd_journal_prepare {
+      if [ -n "${OSD_JOURNAL}" ]; then
+        if [ -b ${OSD_JOURNAL} ]; then
+          OSD_JOURNAL=$(readlink -f ${OSD_JOURNAL})
+          OSD_JOURNAL_PARTITION=$(echo ${OSD_JOURNAL} | sed 's/[^0-9]//g')
+          local jdev=$(echo ${OSD_JOURNAL} | sed 's/[0-9]//g')
+          if [ -z "${OSD_JOURNAL_PARTITION}" ]; then
+            OSD_JOURNAL=$(dev_part ${jdev} ${OSD_JOURNAL_PARTITION})
+          else
+            OSD_JOURNAL=${OSD_JOURNAL}
+          fi
+        elif [ "x$JOURNAL_TYPE" != "xdirectory" ]; then
+          # The block device exists but doesn't appear to be paritioned, we will proceed with parititioning the device.
+          OSD_JOURNAL=$(readlink -f ${OSD_JOURNAL})
+          until [ -b ${OSD_JOURNAL} ]; do
+            osd_journal_create ${OSD_JOURNAL}
+          done
+        fi
+        chown ceph. ${OSD_JOURNAL};
+      elif [ "x$JOURNAL_TYPE" != "xdirectory" ]; then
+        echo "No journal device specified. OSD and journal will share ${OSD_DEVICE}"
+        echo "For better performance on HDD, consider moving your journal to a separate device"
+      fi
+      CLI_OPTS="${CLI_OPTS} --filestore"
+    }
+    
+    if ! [ "x${STORAGE_TYPE%-*}" == "xdirectory" ]; then
+      osd_disk_prepare
+    fi
+    
+  osd-common-ceph-volume.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    : "${CRUSH_LOCATION:=root=default host=${HOSTNAME}}"
+    : "${OSD_PATH_BASE:=/var/lib/ceph/osd/${CLUSTER}}"
+    : "${CEPH_CONF:="/etc/ceph/${CLUSTER}.conf"}"
+    : "${OSD_BOOTSTRAP_KEYRING:=/var/lib/ceph/bootstrap-osd/${CLUSTER}.keyring}"
+    : "${OSD_JOURNAL_UUID:=$(uuidgen)}"
+    : "${OSD_JOURNAL_SIZE:=$(awk '/^osd_journal_size/{print $3}' ${CEPH_CONF}.template)}"
+    : "${OSD_WEIGHT:=1.0}"
+    
+    eval CRUSH_FAILURE_DOMAIN_TYPE=$(cat /etc/ceph/storage.json | python -c 'import sys, json; data = json.load(sys.stdin); print(json.dumps(data["failure_domain"]))')
+    eval CRUSH_FAILURE_DOMAIN_NAME=$(cat /etc/ceph/storage.json | python -c 'import sys, json; data = json.load(sys.stdin); print(json.dumps(data["failure_domain_name"]))')
+    eval CRUSH_FAILURE_DOMAIN_BY_HOSTNAME=$(cat /etc/ceph/storage.json | python -c 'import sys, json; data = json.load(sys.stdin); print(json.dumps(data["failure_domain_by_hostname"]))')
+    
+    if [[ $(ceph -v | egrep -q "nautilus|mimic|luminous"; echo $?) -ne 0 ]]; then
+        echo "ERROR- need Luminous/Mimic/Nautilus release"
+        exit 1
+    fi
+    
+    if [ -z "${HOSTNAME}" ]; then
+      echo "HOSTNAME not set; This will prevent to add an OSD into the CRUSH map"
+      exit 1
+    fi
+    
+    if [[ ! -e ${CEPH_CONF}.template ]]; then
+      echo "ERROR- ${CEPH_CONF}.template must exist; get it from your existing mon"
+      exit 1
+    else
+      ENDPOINT=$(kubectl get endpoints ceph-mon-discovery -n ${NAMESPACE} -o json | awk -F'"' -v port=${MON_PORT} \
+                 -v version=v1 -v msgr_version=v2 \
+                 -v msgr2_port=${MON_PORT_V2} \
+                 '/"ip"/{print "["version":"$4":"port"/"0","msgr_version":"$4":"msgr2_port"/"0"]"}' | paste -sd',')
+      if [[ "${ENDPOINT}" == "" ]]; then
+        /bin/sh -c -e "cat ${CEPH_CONF}.template | tee ${CEPH_CONF}" || true
+      else
+        /bin/sh -c -e "cat ${CEPH_CONF}.template | sed 's#mon_host.*#mon_host = ${ENDPOINT}#g' | tee ${CEPH_CONF}" || true
+      fi
+    fi
+    
+    # Wait for a file to exist, regardless of the type
+    function wait_for_file {
+      timeout 10 bash -c "while [ ! -e ${1} ]; do echo 'Waiting for ${1} to show up' && sleep 1 ; done"
+    }
+    
+    function is_available {
+      command -v $@ &>/dev/null
+    }
+    
+    function ceph_cmd_retry() {
+      cnt=0
+      until "ceph" "$@" || [ $cnt -ge 6 ]; do
+        sleep 10
+        ((cnt++))
+      done
+    }
+    
+    function crush_create_or_move {
+      local crush_location=${1}
+      ceph_cmd_retry --cluster "${CLUSTER}" --name="osd.${OSD_ID}" --keyring="${OSD_KEYRING}" \
+        osd crush create-or-move -- "${OSD_ID}" "${OSD_WEIGHT}" ${crush_location}
+    }
+    
+    function crush_add_and_move {
+      local crush_failure_domain_type=${1}
+      local crush_failure_domain_name=${2}
+      local crush_location=$(echo "root=default ${crush_failure_domain_type}=${crush_failure_domain_name} host=${HOSTNAME}")
+      crush_create_or_move "${crush_location}"
+      local crush_failure_domain_location_check=$(ceph_cmd_retry --cluster "${CLUSTER}" --name="osd.${OSD_ID}" --keyring="${OSD_KEYRING}" osd find ${OSD_ID} | grep "${crush_failure_domain_type}" | awk -F '"' '{print $4}')
+      if [ "x${crush_failure_domain_location_check}" != "x${crush_failure_domain_name}" ];  then
+        # NOTE(supamatt): Manually move the buckets for previously configured CRUSH configurations
+        # as create-or-move may not appropiately move them.
+        ceph_cmd_retry --cluster "${CLUSTER}" --name="osd.${OSD_ID}" --keyring="${OSD_KEYRING}" \
+          osd crush add-bucket "${crush_failure_domain_name}" "${crush_failure_domain_type}" || true
+        ceph_cmd_retry --cluster "${CLUSTER}" --name="osd.${OSD_ID}" --keyring="${OSD_KEYRING}" \
+          osd crush move "${crush_failure_domain_name}" root=default || true
+        ceph_cmd_retry --cluster "${CLUSTER}" --name="osd.${OSD_ID}" --keyring="${OSD_KEYRING}" \
+          osd crush move "${HOSTNAME}" "${crush_failure_domain_type}=${crush_failure_domain_name}" || true
+      fi
+    }
+    
+    function crush_location {
+      if [ "x${CRUSH_FAILURE_DOMAIN_TYPE}" != "xhost" ]; then
+        if [ "x${CRUSH_FAILURE_DOMAIN_NAME}" != "xfalse" ]; then
+          crush_add_and_move "${CRUSH_FAILURE_DOMAIN_TYPE}" "${CRUSH_FAILURE_DOMAIN_NAME}"
+        elif [ "x${CRUSH_FAILURE_DOMAIN_BY_HOSTNAME}" != "xfalse" ]; then
+          crush_add_and_move "${CRUSH_FAILURE_DOMAIN_TYPE}" "$(echo ${CRUSH_FAILURE_DOMAIN_TYPE}_$(echo ${HOSTNAME} | cut -c ${CRUSH_FAILURE_DOMAIN_BY_HOSTNAME}))"
+        else
+          # NOTE(supamatt): neither variables are defined then we fall back to default behavior
+          crush_create_or_move "${CRUSH_LOCATION}"
+        fi
+      else
+        crush_create_or_move "${CRUSH_LOCATION}"
+      fi
+    }
+    
+    # Calculate proper device names, given a device and partition number
+    function dev_part {
+      local osd_device=${1}
+      local osd_partition=${2}
+    
+      if [[ -L ${osd_device} ]]; then
+        # This device is a symlink. Work out it's actual device
+        local actual_device=$(readlink -f "${osd_device}")
+        local bn=$(basename "${osd_device}")
+        if [[ "${actual_device:0-1:1}" == [0-9] ]]; then
+          local desired_partition="${actual_device}p${osd_partition}"
+        else
+          local desired_partition="${actual_device}${osd_partition}"
+        fi
+        # Now search for a symlink in the directory of $osd_device
+        # that has the correct desired partition, and the longest
+        # shared prefix with the original symlink
+        local symdir=$(dirname "${osd_device}")
+        local link=""
+        local pfxlen=0
+        for option in ${symdir}/*; do
+          [[ -e $option ]] || break
+          if [[ $(readlink -f "${option}") == "${desired_partition}" ]]; then
+            local optprefixlen=$(prefix_length "${option}" "${bn}")
+            if [[ ${optprefixlen} > ${pfxlen} ]]; then
+              link=${symdir}/${option}
+              pfxlen=${optprefixlen}
+            fi
+          fi
+        done
+        if [[ $pfxlen -eq 0 ]]; then
+          >&2 echo "Could not locate appropriate symlink for partition ${osd_partition} of ${osd_device}"
+          exit 1
+        fi
+        echo "$link"
+      elif [[ "${osd_device:0-1:1}" == [0-9] ]]; then
+        echo "${osd_device}p${osd_partition}"
+      else
+        echo "${osd_device}${osd_partition}"
+      fi
+    }
+    
+    function zap_extra_partitions {
+      # Examine temp mount and delete any block.db and block.wal partitions
+      mountpoint=${1}
+      journal_disk=""
+      journal_part=""
+      block_db_disk=""
+      block_db_part=""
+      block_wal_disk=""
+      block_wal_part=""
+    
+      # Discover journal, block.db, and block.wal partitions first before deleting anything
+      # If the partitions are on the same disk, deleting one can affect discovery of the other(s)
+      if [ -L "${mountpoint}/journal" ]; then
+        journal_disk=$(readlink -m ${mountpoint}/journal | sed 's/[0-9]*//g')
+        journal_part=$(readlink -m ${mountpoint}/journal | sed 's/[^0-9]*//g')
+      fi
+      if [ -L "${mountpoint}/block.db" ]; then
+        block_db_disk=$(readlink -m ${mountpoint}/block.db | sed 's/[0-9]*//g')
+        block_db_part=$(readlink -m ${mountpoint}/block.db | sed 's/[^0-9]*//g')
+      fi
+      if [ -L "${mountpoint}/block.wal" ]; then
+        block_wal_disk=$(readlink -m ${mountpoint}/block.wal | sed 's/[0-9]*//g')
+        block_wal_part=$(readlink -m ${mountpoint}/block.wal | sed 's/[^0-9]*//g')
+      fi
+    
+      # Delete any discovered journal, block.db, and block.wal partitions
+      if [ ! -z "${journal_disk}" ]; then
+        sgdisk -d ${journal_part} ${journal_disk}
+        /sbin/udevadm settle --timeout=600
+        /usr/bin/flock -s ${journal_disk} /sbin/partprobe ${journal_disk}
+        /sbin/udevadm settle --timeout=600
+      fi
+      if [ ! -z "${block_db_disk}" ]; then
+        sgdisk -d ${block_db_part} ${block_db_disk}
+        /sbin/udevadm settle --timeout=600
+        /usr/bin/flock -s ${block_db_disk} /sbin/partprobe ${block_db_disk}
+        /sbin/udevadm settle --timeout=600
+      fi
+      if [ ! -z "${block_wal_disk}" ]; then
+        sgdisk -d ${block_wal_part} ${block_wal_disk}
+        /sbin/udevadm settle --timeout=600
+        /usr/bin/flock -s ${block_wal_disk} /sbin/partprobe ${block_wal_disk}
+        /sbin/udevadm settle --timeout=600
+      fi
+    }
+    
+    function disk_zap {
+      # Run all the commands that ceph-disk zap uses to clear a disk
+      local device=${1}
+      local osd_device_lvm=$(lsblk ${device} -o name,type -l | grep "lvm" | grep "ceph"| awk '{print $1}')
+      if [[ ! -z ${osd_device_lvm} ]]; then
+        dmsetup remove ${osd_device_lvm}
+      fi
+      if [[ $(pvdisplay ${OSD_DEVICE} | grep "VG Name" | awk '{print $3}' | grep "ceph") ]]; then
+        local LOCAL_VG=$(pvdisplay ${OSD_DEVICE} | grep "VG Name" | awk '{print $3}' | grep "ceph")
+        if [[ $(lvdisplay | grep ${LOCAL_VG} | grep "LV Path" | awk '{print $3}') ]]; then
+          echo "y" | lvremove $(lvdisplay | grep ${LOCAL_VG} | grep "LV Path" | awk '{print $3}')
+        fi
+        vgremove ${LOCAL_VG}
+        pvremove ${OSD_DEVICE}
+        ceph-volume lvm zap ${device} --destroy
+      fi
+      wipefs --all ${device}
+      # Wipe the first 200MB boundary, as Bluestore redeployments will not work otherwise
+      dd if=/dev/zero of=${device} bs=1M count=200
+      sgdisk --zap-all -- ${device}
+    }
+    
+    function udev_settle {
+      partprobe "${OSD_DEVICE}"
+      if [ "${OSD_BLUESTORE:-0}" -eq 1 ]; then
+        if [ ! -z "$BLOCK_DB" ]; then
+          partprobe "${BLOCK_DB}"
+        fi
+        if [ ! -z "$BLOCK_WAL" ] && [ "$BLOCK_WAL" != "$BLOCK_DB" ]; then
+          partprobe "${BLOCK_WAL}"
+        fi
+      else
+        if [ "x$JOURNAL_TYPE" == "xblock-logical" ] && [ ! -z "$OSD_JOURNAL" ]; then
+          OSD_JOURNAL=$(readlink -f ${OSD_JOURNAL})
+          if [ ! -z "$OSD_JOURNAL" ]; then
+            local JDEV=$(echo ${OSD_JOURNAL} | sed 's/[0-9]//g')
+            partprobe "${JDEV}"
+          fi
+        fi
+      fi
+      # watch the udev event queue, and exit if all current events are handled
+      udevadm settle --timeout=600
+    
+      # On occassion udev may not make the correct device symlinks for Ceph, just in case we make them manually
+      mkdir -p /dev/disk/by-partuuid
+      for dev in $(awk '!/rbd/{print $4}' /proc/partitions | grep "[0-9]"); do
+        diskdev=$(echo "${dev//[!a-z]/}")
+        partnum=$(echo "${dev//[!0-9]/}")
+        ln -s "../../${dev}" "/dev/disk/by-partuuid/$(sgdisk -i ${partnum} /dev/${diskdev} | awk '/Partition unique GUID/{print tolower($4)}')" || true
+      done
+    }
+    
+    # Helper function to get an lvm tag from a logical volume
+    function get_lvm_tag_from_volume {
+      logical_volume="$1"
+      tag="$2"
+    
+      if [[ -z "${logical_volume}" ]]; then
+        # Return an empty string if the logical volume doesn't exist
+        echo
+      else
+        # Get and return the specified tag from the logical volume
+        echo "$(lvs -o lv_tags ${logical_volume} | tr ',' '\n' | grep ${tag} | cut -d'=' -f2)"
+      fi
+    }
+    
+    function get_lvm_tag_from_device {
+      device="$1"
+      tag="$2"
+      # Attempt to get a logical volume for the physical device
+      logical_volume="$(pvdisplay -m ${device} | awk '/Logical volume/{print $3}')"
+    
+      # Use get_lvm_tag_from_volume to get the specified tag from the logical volume
+      echo "$(get_lvm_tag_from_volume ${logical_volume} ${tag})"
+    }
+    
+    # Helper function get a cluster FSID from a physical device
+    function get_cluster_fsid_from_device {
+      device="$1"
+    
+      # Use get_lvm_tag_from_device to get the cluster FSID from the device
+      echo "$(get_lvm_tag_from_device ${device} ceph.cluster_fsid)"
+    }
+    
+    # Helper function to get an OSD ID from a logical volume
+    function get_osd_id_from_volume {
+      logical_volume="$1"
+    
+      # Use get_lvm_tag_from_volume to get the OSD ID from the logical volume
+      echo "$(get_lvm_tag_from_volume ${logical_volume} ceph.osd_id)"
+    }
+    
+    # Helper function get an OSD ID from a physical device
+    function get_osd_id_from_device {
+      device="$1"
+    
+      # Use get_lvm_tag_from_device to get the OSD ID from the device
+      echo "$(get_lvm_tag_from_device ${device} ceph.osd_id)"
+    }
+    
+    # Helper function get an OSD FSID from a physical device
+    function get_osd_fsid_from_device {
+      device="$1"
+    
+      # Use get_lvm_tag_from_device to get the OSD FSID from the device
+      echo "$(get_lvm_tag_from_device ${device} ceph.osd_fsid)"
+    }
+    
+    # Helper function get an OSD DB device from a physical device
+    function get_osd_db_device_from_device {
+      device="$1"
+    
+      # Use get_lvm_tag_from_device to get the OSD DB device from the device
+      echo "$(get_lvm_tag_from_device ${device} ceph.db_device)"
+    }
+    
+    # Helper function get an OSD WAL device from a physical device
+    function get_osd_wal_device_from_device {
+      device="$1"
+    
+      # Use get_lvm_tag_from_device to get the OSD WAL device from the device
+      echo "$(get_lvm_tag_from_device ${device} ceph.wal_device)"
+    }
+    
+  osd-init.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    echo "Initializing the osd with ${DEPLOY_TOOL}"
+    exec "/tmp/init-${DEPLOY_TOOL}.sh"
+    
+  osd-check.sh: |
+    #!/bin/sh
+    
+    # Copyright 2017 The Openstack-Helm Authors.
+    #
+    # Licensed under the Apache License, Version 2.0 (the "License");
+    # you may not use this file except in compliance with the License.
+    # You may obtain a copy of the License at
+    #
+    #   http://www.apache.org/licenses/LICENSE-2.0
+    #
+    # Unless required by applicable law or agreed to in writing, software
+    # distributed under the License is distributed on an "AS IS" BASIS,
+    # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    # See the License for the specific language governing permissions and
+    # limitations under the License.
+    
+    # A liveness check for ceph OSDs: exit 0 if
+    # all OSDs on this host are in the "active" state
+    # per their admin sockets.
+    
+    SOCKDIR=${CEPH_SOCKET_DIR:-/run/ceph}
+    SBASE=${CEPH_OSD_SOCKET_BASE:-ceph-osd}
+    SSUFFIX=${CEPH_SOCKET_SUFFIX:-asok}
+    
+    # default: no sockets, not live
+    cond=1
+    for sock in $SOCKDIR/$SBASE.*.$SSUFFIX; do
+     if [ -S $sock ]; then
+      OSD_ID=$(echo $sock | awk -F. '{print $2}')
+      OSD_STATE=$(ceph -f json-pretty --connect-timeout 1 --admin-daemon "${sock}" status|grep state|sed 's/.*://;s/[^a-z]//g')
+      echo "OSD ${OSD_ID} ${OSD_STATE}";
+      # this might be a stricter check than we actually want.  what are the
+      # other values for the "state" field?
+      if [ "x${OSD_STATE}x" = 'xactivex' ]; then
+       cond=0
+      else
+       # one's not ready, so the whole pod's not ready.
+       exit 1
+      fi
+     else
+      echo "No daemon sockets found in $SOCKDIR"
+     fi
+    done
+    exit $cond
+    
+  osd-stop.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    if [ "x${STORAGE_TYPE%-*}" == "xblock" ]; then
+      OSD_DEVICE=$(readlink -f ${STORAGE_LOCATION})
+      OSD_JOURNAL=$(readlink -f ${JOURNAL_LOCATION})
+      if [ "x${STORAGE_TYPE#*-}" == "xlogical" ]; then
+        CEPH_OSD_PID="$(cat /run/ceph-osd.pid)"
+        while kill -0 ${CEPH_OSD_PID} >/dev/null 2>&1; do
+            kill -SIGTERM ${CEPH_OSD_PID}
+            sleep 1
+        done
+        umount "$(findmnt -S "${OSD_DEVICE}1" | tail -n +2 | awk '{ print $1 }')"
+      fi
+    fi
+    
+  init-dirs.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    export LC_ALL=C
+    : "${OSD_BOOTSTRAP_KEYRING:=/var/lib/ceph/bootstrap-osd/${CLUSTER}.keyring}"
+    
+    mkdir -p "$(dirname "${OSD_BOOTSTRAP_KEYRING}")"
+    
+    # Let's create the ceph directories
+    for DIRECTORY in osd tmp; do
+      mkdir -p "/var/lib/ceph/${DIRECTORY}"
+    done
+    
+    # Create socket directory
+    mkdir -p /run/ceph
+    
+    # Adjust the owner of all those directories
+    chown -R ceph. /run/ceph/ /var/lib/ceph/*
+    
+  helm-tests.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    function check_osd_count() {
+      echo "#### Start: Checking OSD count ####"
+      num_osd=$(ceph osd stat | tr ' ' '\n' | grep -x -E '[0-9]+' | head -n1)
+      num_in_osds=$(ceph osd stat | tr ' ' '\n' | grep -x -E '[0-9]+' | tail -n1)
+      num_up_osds=$(ceph osd stat | tr ' ' '\n' | grep -x -E '[0-9]+' | head -n2 | tail -n1)
+    
+      if [ ${num_osd} -eq 1 ]; then
+        MIN_OSDS=${num_osd}
+      else
+        MIN_OSDS=$((${num_osd}*$REQUIRED_PERCENT_OF_OSDS/100))
+      fi
+    
+      if [ "${num_osd}" -eq 0 ]; then
+        echo "There are no osds in the cluster"
+        exit 1
+      elif [ "${num_in_osds}" -ge "${MIN_OSDS}" ] && [ "${num_up_osds}" -ge "${MIN_OSDS}"  ]; then
+        echo "Required number of OSDs (${MIN_OSDS}) are UP and IN status"
+      else
+        echo "Required number of OSDs (${MIN_OSDS}) are NOT UP and IN status. Cluster shows OSD count=${num_osd}, UP=${num_up_osds}, IN=${num_in_osds}"
+        exit 1
+      fi
+    }
+    
+    check_osd_count
+    
+  utils-checkDNS.sh: |
+    #!/bin/bash
+    
+    
+    
+    : "${CEPH_CONF:="/etc/ceph/${CLUSTER}.conf"}"
+    ENDPOINT="{$1}"
+    
+    function check_mon_dns () {
+      GREP_CMD=$(grep -rl 'ceph-mon' ${CEPH_CONF})
+    
+      if [[ "${ENDPOINT}" == "up" ]]; then
+        echo "If DNS is working, we are good here"
+      elif [[ "${ENDPOINT}" != "" ]]; then
+        if [[ ${GREP_CMD} != "" ]]; then
+          # No DNS, write CEPH MONs IPs into ${CEPH_CONF}
+          sh -c -e "cat ${CEPH_CONF}.template | sed 's/mon_host.*/mon_host = ${ENDPOINT}/g' | tee ${CEPH_CONF}" > /dev/null 2>&1
+        else
+          echo "endpoints are already cached in ${CEPH_CONF}"
+          exit
+        fi
+      fi
+    }
+    
+    check_mon_dns
+    
+    exit
+    
+  utils-defragOSDs.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    if [ "x${STORAGE_TYPE%-*}" == "xblock" ]; then
+      OSD_DEVICE=$(readlink -f ${STORAGE_LOCATION})
+      ODEV=$(echo ${OSD_DEVICE} | sed 's/[0-9]//g' | cut -f 3 -d '/')
+      OSD_PATH=$(cat /proc/mounts | awk '/ceph-/{print $2}')
+      OSD_STORE=$(cat ${OSD_PATH}/type)
+      DATA_PART=$(cat /proc/mounts | awk '/ceph-/{print $1}')
+    
+      ODEV_ROTATIONAL=$(cat /sys/block/${ODEV}/queue/rotational)
+      ODEV_SCHEDULER=$(cat /sys/block/${ODEV}/queue/scheduler | tr -d '[]')
+    
+      # NOTE(supamatt): TODO implement bluestore defrag options once it's available upstream
+      if [ "${ODEV_ROTATIONAL}" -eq "1" ] && [ "x${OSD_STORE}" == "xfilestore" ]; then
+        # NOTE(supamatt): Switch to CFQ in order to not block I/O
+        echo "cfq" | tee /sys/block/${ODEV}/queue/scheduler || true
+        ionice -c 3 xfs_fsr "${OSD_DEVICE}" 2>/dev/null
+        # NOTE(supamatt): Switch back to previous IO scheduler
+        echo ${ODEV_SCHEDULER} | tee /sys/block/${ODEV}/queue/scheduler || true
+      fi
+    fi
+    
+    exit 0
+    

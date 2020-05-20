@@ -1,0 +1,213 @@
+---
+# Source: ceph-client/templates/deployment-checkdns.yaml
+
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ceph-checkdns
+  namespace: ceph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: release-name-ceph-checkdns
+  namespace: ceph
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: release-name-ceph-ceph-checkdns
+subjects:
+  - kind: ServiceAccount
+    name: ceph-checkdns
+    namespace: ceph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: release-name-ceph-ceph-checkdns
+  namespace: ceph
+rules:
+  - apiGroups:
+      - ""
+      - extensions
+      - batch
+      - apps
+    verbs:
+      - get
+      - list
+    resources:
+      - services
+      - endpoints
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ceph-checkdns
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+      - endpoints
+      - pods/exec
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ceph-checkdns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ceph-checkdns
+subjects:
+  - kind: ServiceAccount
+    name: ceph-checkdns
+    namespace: ceph
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: ceph-checkdns
+  annotations:
+    configmap-bin-hash: "5fd1036f20f2a0cf409d2c0ea9cf55b5a1802d26108b1fb59968086d8ade73b0"
+  labels:
+    release_group: release-name
+    application: ceph
+    component: checkdns
+spec:
+  selector:
+    matchLabels:
+      release_group: release-name
+      application: ceph
+      component: checkdns
+  template:
+    metadata:
+      labels:
+        release_group: release-name
+        application: ceph
+        component: checkdns
+      annotations:
+        "openstackhelm.openstack.org/release_uuid": ""
+        
+        container.apparmor.security.beta.kubernetes.io/ceph-checkdns: runtime/default
+        container.apparmor.security.beta.kubernetes.io/init: runtime/default
+    spec:
+      securityContext:
+        runAsUser: 65534
+        
+      serviceAccountName: ceph-checkdns
+      affinity:
+        
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: release_group
+                    operator: In
+                    values:
+                    - release-name
+                  - key: application
+                    operator: In
+                    values:
+                    - ceph
+                  - key: component
+                    operator: In
+                    values:
+                    - checkdns
+                  
+              topologyKey: kubernetes.io/hostname
+            weight: 10
+      nodeSelector:
+        ceph-mon: enabled
+      initContainers:
+        
+        - name: init
+          image: "quay.io/airshipit/kubernetes-entrypoint:v1.0.0"
+          imagePullPolicy: IfNotPresent  
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65534
+            
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: INTERFACE_NAME
+              value: eth0
+            - name: PATH
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/
+            - name: DEPENDENCY_SERVICE
+              value: "ceph:ceph-mon"
+            - name: DEPENDENCY_DAEMONSET
+              value: ""
+            - name: DEPENDENCY_CONTAINER
+              value: ""
+            - name: DEPENDENCY_POD_JSON
+              value: ""
+            - name: DEPENDENCY_CUSTOM_RESOURCE
+              value: ""
+          command:
+            - kubernetes-entrypoint
+          volumeMounts:
+            []
+            
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: ceph-checkdns
+          image: "docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200416"
+          imagePullPolicy: IfNotPresent
+          
+          
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            
+          env:
+            - name: CLUSTER
+              value: "ceph"
+            - name: K8S_HOST_NETWORK
+              value: "1"
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: MON_PORT
+              value: "6789"
+            - name: MON_PORT_V2
+              value: "3300"
+            - name: KUBECTL_PARAM
+              value:           -l application=ceph -l component=checkdns
+          command:
+            - /tmp/_start.sh
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: ceph-client-bin
+              mountPath: /tmp/_start.sh
+              subPath: utils-checkDNS_start.sh
+              readOnly: true
+      volumes:
+        - name: pod-tmp
+          emptyDir: {}
+        - name: ceph-client-bin
+          configMap:
+            name: ceph-client-bin
+            defaultMode: 0555

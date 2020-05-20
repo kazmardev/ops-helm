@@ -1,0 +1,38 @@
+---
+# Source: ceph-mon/templates/configmap-templates.yaml
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ceph-templates
+data:
+  admin.keyring: |
+    [client.admin]
+      key = {{ key }}
+      auid = 0
+      caps mds = "allow"
+      caps mon = "allow *"
+      caps osd = "allow *"
+      caps mgr = "allow *"
+    
+  mon.keyring: |
+    [mon.]
+      key = {{ key }}
+      caps mon = "allow *"
+    
+  bootstrap.keyring.mds: |
+    [client.bootstrap-mds]
+      key = {{ key }}
+      caps mon = "allow profile bootstrap-mds"
+    
+  bootstrap.keyring.mgr: |
+    [client.bootstrap-mgr]
+      key = {{ key }}
+      caps mgr = "allow profile bootstrap-mgr"
+    
+  bootstrap.keyring.osd: |
+    [client.bootstrap-osd]
+      key = {{ key }}
+      caps mon = "allow profile bootstrap-osd"
+    
