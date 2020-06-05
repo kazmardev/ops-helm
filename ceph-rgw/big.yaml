@@ -1,0 +1,1428 @@
+---
+# Source: ceph-rgw/templates/network_policy.yaml
+# Copyright 2017-2018 The Openstack-Helm Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rgw-netpol
+  namespace: osh-infra
+spec:
+  policyTypes:
+    - Egress
+
+    - Ingress
+
+  podSelector:
+    matchLabels:
+
+      application: ceph
+      component: rgw
+
+  egress:
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            name: ceph
+      ports:
+      - port: 6789
+        protocol: TCP
+      - port: 3300
+        protocol: TCP
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            name: osh-infra
+      ports:
+      - port: 8088
+        protocol: TCP
+      - port: 80
+        protocol: TCP
+    - to:
+      - podSelector:
+          matchLabels:
+            application: keystone
+      ports:
+      - port: 80
+        protocol: TCP
+      - port: 5000
+        protocol: TCP
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            name: kube-system
+      ports:
+      - port: 53
+        protocol: UDP
+      - port: 53
+        protocol: TCP
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            name: docker-registry
+      ports:
+      - port: 5000
+        protocol: TCP
+    - to:
+      - podSelector:
+          matchLabels:
+            application: ceph
+      ports:
+      - port: 8088
+        protocol: TCP
+      - port: 80
+        protocol: TCP
+    - {}
+    
+  ingress:
+    - {}
+    
+---
+# Source: ceph-rgw/templates/secret-keystone-rgw.yaml
+
+
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ceph-keystone-user-rgw
+type: Opaque
+data:  
+  OS_AUTH_URL: aHR0cDovL2tleXN0b25lLWFwaS5vc2gtaW5mcmEuc3ZjLmNsdXN0ZXIubG9jYWw6NTAwMC92Mw==
+  OS_REGION_NAME: UmVnaW9uT25l
+  OS_INTERFACE: aW50ZXJuYWw=
+  OS_PROJECT_DOMAIN_NAME: c2VydmljZQ==
+  OS_PROJECT_NAME: c2VydmljZQ==
+  OS_USER_DOMAIN_NAME: c2VydmljZQ==
+  OS_USERNAME: c3dpZnQ=
+  OS_PASSWORD: cGFzc3dvcmQ=
+  OS_DEFAULT_DOMAIN: ZGVmYXVsdA==
+  OS_AUTH_TYPE: cGFzc3dvcmQ=
+  OS_TENANT_NAME: YWRtaW4=
+
+
+---
+# Source: ceph-rgw/templates/secret-s3-rgw.yaml
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: radosgw-s3-admin-creds
+type: Opaque
+data:
+  S3_ADMIN_USERNAME: czNfYWRtaW4=
+  S3_ADMIN_ACCESS_KEY: YWRtaW5fYWNjZXNzX2tleQ==
+  S3_ADMIN_SECRET_KEY: YWRtaW5fc2VjcmV0X2tleQ==
+
+---
+# Source: ceph-rgw/templates/configmap-bin.yaml
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ceph-rgw-bin
+data:
+
+  init-dirs.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    export LC_ALL=C
+    : "${HOSTNAME:=$(uname -n)}"
+    : "${RGW_NAME:=${HOSTNAME}}"
+    : "${RGW_BOOTSTRAP_KEYRING:=/var/lib/ceph/bootstrap-rgw/${CLUSTER}.keyring}"
+    
+    for keyring in ${RGW_BOOTSTRAP_KEYRING}; do
+      mkdir -p "$(dirname "$keyring")"
+    done
+    
+    # Let's create the ceph directories
+    for DIRECTORY in radosgw tmp; do
+      mkdir -p "/var/lib/ceph/${DIRECTORY}"
+    done
+    
+    # Create socket directory
+    mkdir -p /run/ceph
+    
+    # Creating rados directories
+    mkdir -p "/var/lib/ceph/radosgw/${RGW_NAME}"
+    
+    # Clean the folder
+    rm -f "$(dirname "${RGW_BOOTSTRAP_KEYRING}"/*)"
+    
+    # Adjust the owner of all those directories
+    chown -R ceph. /run/ceph/ /var/lib/ceph/*
+    
+
+  rgw-start.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    export LC_ALL=C
+    : "${CEPH_GET_ADMIN_KEY:=0}"
+    : "${RGW_NAME:=$(uname -n)}"
+    : "${RGW_ZONEGROUP:=}"
+    : "${RGW_ZONE:=}"
+    : "${ADMIN_KEYRING:=/etc/ceph/${CLUSTER}.client.admin.keyring}"
+    : "${RGW_KEYRING:=/var/lib/ceph/radosgw/${RGW_NAME}/keyring}"
+    : "${RGW_BOOTSTRAP_KEYRING:=/var/lib/ceph/bootstrap-rgw/${CLUSTER}.keyring}"
+    
+    if [[ ! -e "/etc/ceph/${CLUSTER}.conf" ]]; then
+      echo "ERROR- /etc/ceph/${CLUSTER}.conf must exist; get it from your existing mon"
+      exit 1
+    fi
+    
+    if [ "${CEPH_GET_ADMIN_KEY}" -eq 1 ]; then
+      if [[ ! -e "${ADMIN_KEYRING}" ]]; then
+          echo "ERROR- ${ADMIN_KEYRING} must exist; get it from your existing mon"
+          exit 1
+      fi
+    fi
+    
+    # Check to see if our RGW has been initialized
+    if [ ! -e "${RGW_KEYRING}" ]; then
+    
+      if [ ! -e "${RGW_BOOTSTRAP_KEYRING}" ]; then
+        echo "ERROR- ${RGW_BOOTSTRAP_KEYRING} must exist. You can extract it from your current monitor by running 'ceph auth get client.bootstrap-rgw -o ${RGW_BOOTSTRAP_KEYRING}'"
+        exit 1
+      fi
+    
+      timeout 10 ceph --cluster "${CLUSTER}" --name "client.bootstrap-rgw" --keyring "${RGW_BOOTSTRAP_KEYRING}" health || exit 1
+    
+      # Generate the RGW key
+      ceph --cluster "${CLUSTER}" --name "client.bootstrap-rgw" --keyring "${RGW_BOOTSTRAP_KEYRING}" auth get-or-create "client.rgw.${RGW_NAME}" osd 'allow rwx' mon 'allow rw' -o "${RGW_KEYRING}"
+      chown ceph. "${RGW_KEYRING}"
+      chmod 0600 "${RGW_KEYRING}"
+    fi
+    
+    /usr/bin/radosgw \
+      --cluster "${CLUSTER}" \
+      --setuser "ceph" \
+      --setgroup "ceph" \
+      -d \
+      -n "client.rgw.${RGW_NAME}" \
+      -k "${RGW_KEYRING}" \
+      --rgw-socket-path="" \
+      --rgw-zonegroup="${RGW_ZONEGROUP}" \
+      --rgw-zone="${RGW_ZONE}"
+    
+  rgw-init.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    cp -va /etc/ceph/ceph.conf.template /etc/ceph/ceph.conf
+    
+    cat >> /etc/ceph/ceph.conf <<EOF
+    
+    [client.rgw.$(hostname -s)]
+    rgw_dynamic_resharding = "false"
+    rgw_gc_max_objs = "997"
+    rgw_keystone_token_cache_size = "0"
+    rgw_num_rados_handles = "4"
+    rgw_override_bucket_index_max_shards = "8"
+    
+    
+    rgw_frontends = "beast port=${RGW_FRONTEND_PORT}"
+    rgw_relaxed_s3_bucket_names = "true"
+    
+    EOF
+    
+  storage-init.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -x
+    if [ "x$STORAGE_BACKEND" == "xceph-rgw" ]; then
+      SECRET=$(mktemp --suffix .yaml)
+      KEYRING=$(mktemp --suffix .keyring)
+      function cleanup {
+          rm -f ${SECRET} ${KEYRING}
+      }
+      trap cleanup EXIT
+    fi
+    
+    function kube_ceph_keyring_gen () {
+      CEPH_KEY=$1
+      CEPH_KEY_TEMPLATE=$2
+      sed "s|{{ key }}|${CEPH_KEY}|" /tmp/ceph-templates/${CEPH_KEY_TEMPLATE} | base64 -w0 | tr -d '\n'
+    }
+    
+    set -ex
+    if [ "x$STORAGE_BACKEND" == "xceph-rgw" ]; then
+      ceph -s
+      if USERINFO=$(ceph auth get client.bootstrap-rgw); then
+        KEYSTR=$(echo $USERINFO | sed 's/.*\( key = .*\) caps mon.*/\1/')
+        echo $KEYSTR  > ${KEYRING}
+      else
+        #NOTE(Portdirect): Determine proper privs to assign keyring
+        ceph auth get-or-create client.bootstrap-rgw \
+          mon "allow profile bootstrap-rgw" \
+          -o ${KEYRING}
+      fi
+      FINAL_KEYRING=$(sed -n 's/^[[:blank:]]*key[[:blank:]]\+=[[:blank:]]\(.*\)/\1/p' ${KEYRING})
+      cat > ${SECRET} <<EOF
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: "os-ceph-bootstrap-rgw-keyring"
+    type: Opaque
+    data:
+     ceph.keyring: $( kube_ceph_keyring_gen ${FINAL_KEYRING} "bootstrap.keyring.rgw"  )
+    EOF
+      kubectl apply --namespace ${NAMESPACE} -f ${SECRET}
+    
+    fi
+    
+  ceph-admin-keyring.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    export HOME=/tmp
+    
+    cat <<EOF > /etc/ceph/ceph.client.admin.keyring
+    [client.admin]
+        key = $(cat /tmp/client-keyring)
+    EOF
+    
+    exit 0
+    
+  rgw-s3-admin.sh: |    
+    #!/bin/bash
+    
+    set -e
+    
+    function create_s3_user () {
+      echo "Creating s3 user and key pair"
+      radosgw-admin user create \
+        --uid=${S3_USERNAME} \
+        --display-name=${S3_USERNAME} \
+        --key-type=s3 \
+        --access-key ${S3_ACCESS_KEY} \
+        --secret-key ${S3_SECRET_KEY}
+    }
+    
+    function update_s3_user () {
+      # Retrieve old access keys, if they exist
+      old_access_keys=$(radosgw-admin user info --uid=${S3_USERNAME} \
+        | jq -r '.keys[].access_key' || true)
+    
+      if [[ ! -z ${old_access_keys} ]]; then
+        for access_key in $old_access_keys; do
+          # If current access key is the same as the key supplied, do nothing.
+          if [ "$access_key" == "${S3_ACCESS_KEY}" ]; then
+            echo "Current user and key pair exists."
+            continue
+          else
+            # If keys differ, remove previous key
+            radosgw-admin key rm --uid=${S3_USERNAME} --key-type=s3 --access-key=$access_key
+          fi
+        done
+      fi
+    
+      # Perform one more additional check to account for scenarios where multiple
+      # key pairs existed previously, but one existing key was the supplied key
+      current_access_key=$(radosgw-admin user info --uid=${S3_USERNAME} \
+        | jq -r '.keys[].access_key' || true)
+    
+      # If the supplied key does not exist, modify the user
+      if [[ -z ${current_access_key} ]]; then
+        # Modify user with new access and secret keys
+        echo "Updating existing user's key pair"
+        radosgw-admin user modify \
+          --uid=${S3_USERNAME}\
+          --access-key ${S3_ACCESS_KEY} \
+          --secret-key ${S3_SECRET_KEY}
+      fi
+    }
+    
+    user_exists=$(radosgw-admin user info --uid=${S3_USERNAME} || true)
+    if [[ -z ${user_exists} ]]; then
+      create_s3_user
+    else
+      update_s3_user
+    fi
+  helm-tests.sh: |
+    #!/bin/bash
+    
+    
+    
+    set -ex
+    
+    tmpdir=$(mktemp -d)
+    declare -a objects_list
+    total_objects=10
+    
+    #NOTE: This function tests keystone based auth. It uses ceph_config_helper
+    #container image that has openstack and ceph installed
+    function rgw_keystone_bucket_validation ()
+    {
+      echo "function: rgw_keystone_bucket_validation"
+      openstack service list
+    
+      bucket_stat="$(openstack container list | grep openstack_test_container || true)"
+      if [[ -n "${bucket_stat}" ]]; then
+        echo "--> deleting openstack_test_container container"
+        openstack container delete --recursive openstack_test_container
+      fi
+    
+      echo "--> creating openstack_test_container container"
+      openstack container create 'openstack_test_container'
+    
+      echo "--> list containers"
+      openstack container list
+    
+      bucket_stat="$(openstack container list | grep openstack_test_container || true)"
+      if [[ -z "${bucket_stat}" ]]; then
+        echo "--> container openstack_test_container not found"
+        exit 1
+      else
+        echo "--> container openstack_test_container found"
+    
+        for i in $(seq $total_objects); do
+          openstack object create --name "${objects_list[$i]}" openstack_test_container "${objects_list[$i]}"
+          echo "--> file ${objects_list[$i]} uploaded to openstack_test_container container"
+        done
+    
+        echo "--> list contents of openstack_test_container container"
+        openstack object list openstack_test_container
+    
+        for i in $(seq $total_objects); do
+          echo "--> downloading ${objects_list[$i]} object from openstack_test_container container to ${objects_list[$i]}_object${i} file"
+          openstack object save --file "${objects_list[$i]}_object${i}" openstack_test_container "${objects_list[$i]}"
+          check_result $? "Error during openstack CLI execution" "The object downloaded successfully"
+    
+          echo "--> comparing files: ${objects_list[$i]} and ${objects_list[$i]}_object${i}"
+          cmp "${objects_list[$i]}" "${objects_list[$i]}_object${i}"
+          check_result $? "The files are not equal" "The files are equal"
+    
+          echo "--> deleting ${objects_list[$i]} object from openstack_test_container container"
+          openstack object delete openstack_test_container "${objects_list[$i]}"
+          check_result $? "Error during openstack CLI execution" "The object deleted successfully"
+        done
+    
+        echo "--> deleting openstack_test_container container"
+        openstack container delete --recursive openstack_test_container
+    
+        echo "--> bucket list after deleting container"
+        openstack container list
+      fi
+    }
+    
+    #NOTE: This function tests s3 based auto. It uses ceph_rgw container image which has
+    # s3cmd util install
+    function rgw_s3_bucket_validation ()
+    {
+      echo "function: rgw_s3_bucket_validation"
+    
+      bucket=s3://rgw-test-bucket
+      params="--host=$RGW_HOST --host-bucket=$RGW_HOST --access_key=$S3_ADMIN_ACCESS_KEY --secret_key=$S3_ADMIN_SECRET_KEY --no-ssl"
+    
+      bucket_stat="$(s3cmd ls $params | grep ${bucket} || true)"
+      if [[ -n "${bucket_stat}" ]]; then
+        s3cmd del --recursive --force $bucket $params
+        check_result $? "Error during s3cmd execution" "Bucket is deleted"
+      fi
+    
+      s3cmd mb $bucket $params
+      if [ $? -eq 0 ]; then
+        echo "Bucket $bucket created"
+    
+        for i in $(seq $total_objects); do
+          s3cmd put "${objects_list[$i]}" $bucket $params
+          check_result $? "Error during s3cmd execution" "File ${objects_list[$i]##*/} uploaded to bucket"
+        done
+    
+        s3cmd ls $bucket $params
+        check_result $? "Error during s3cmd execution" "Got list of objects"
+    
+        for i in $(seq $total_objects); do
+          s3cmd get "${bucket}/${objects_list[$i]##*/}" -> "${objects_list[$i]}_s3_object${i}" $params
+          check_result $? "Error during s3cmd execution" "File ${objects_list[$i]##*/} downloaded from bucket"
+    
+          echo "Comparing files: ${objects_list[$i]} and ${objects_list[$i]}_s3_object${i}"
+          cmp "${objects_list[$i]}" "${objects_list[$i]}_s3_object${i}"
+          check_result $? "The files are not equal" "The files are equal"
+    
+          s3cmd del "${bucket}/${objects_list[$i]##*/}" $params
+          check_result $? "Error during s3cmd execution" "File from bucket is deleted"
+        done
+    
+        s3cmd del --recursive --force $bucket $params
+        check_result $? "Error during s3cmd execution" "Bucket is deleted"
+    
+      else
+        echo "Error during s3cmd execution"
+        exit 1
+      fi
+    }
+    
+    function check_result ()
+    {
+      red='\033[0;31m'
+      green='\033[0;32m'
+      bw='\033[0m'
+      if [ "$1" -ne 0 ]; then
+        echo -e "${red}$2${bw}"
+        exit 1
+      else
+        echo -e "${green}$3${bw}"
+      fi
+    }
+    
+    function prepare_objects ()
+    {
+      echo "Preparing ${total_objects} files for test"
+      for i in $(seq $total_objects); do
+        objects_list[$i]="$(mktemp -p "$tmpdir")"
+        echo "${objects_list[$i]}"
+        dd if=/dev/urandom of="${objects_list[$i]}" bs=1M count=8
+      done
+    }
+    
+    prepare_objects
+    
+    if [ "$RGW_TEST_TYPE" == RGW_KS ];
+    then
+      echo "--> Keystone is enabled. Calling function to test keystone based auth "
+      rgw_keystone_bucket_validation
+    fi
+    
+    if [ "$RGW_TEST_TYPE" == RGW_S3 ];
+    then
+      echo "--> S3 is enabled. Calling function to test S3 based auth "
+      rgw_s3_bucket_validation
+    fi
+    
+
+---
+# Source: ceph-rgw/templates/configmap-ceph-rgw-templates.yaml
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: "release-name-ceph-templates"
+data:
+  bootstrap.keyring.rgw: |
+    [client.bootstrap-rgw]
+      key = {{ key }}
+      caps mgr = "allow profile bootstrap-rgw"
+    
+
+---
+# Source: ceph-rgw/templates/configmap-etc-client.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ceph-rgw-etc
+data:
+  ceph.conf: |
+    [global]
+    cephx = true
+    cephx_cluster_require_signatures = true
+    cephx_require_signatures = false
+    cephx_service_require_signatures = false
+    debug_ms = 0/0
+    log_file = /dev/stdout
+    mon_cluster_log_file = /dev/stdout
+    mon_host = ceph-mon.ceph.svc.cluster.local:3300
+    objecter_inflight_op_bytes = 1073741824
+    [osd]
+    cluster_network = 20.0.0.0/24
+    ms_bind_port_max = 7100
+    ms_bind_port_min = 6800
+    osd_max_object_name_len = 256
+    osd_mkfs_options_xfs = -f -i size=2048
+    osd_mkfs_type = xfs
+    public_network = 20.0.0.0/24
+    
+
+---
+# Source: ceph-rgw/templates/deployment-rgw.yaml
+
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ceph-rgw
+  namespace: osh-infra
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: release-name-ceph-rgw
+  namespace: osh-infra
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: release-name-osh-infra-ceph-rgw
+subjects:
+  - kind: ServiceAccount
+    name: ceph-rgw
+    namespace: osh-infra
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: release-name-osh-infra-ceph-rgw
+  namespace: osh-infra
+rules:
+  - apiGroups:
+      - ""
+      - extensions
+      - batch
+      - apps
+    verbs:
+      - get
+      - list
+    resources:
+      - jobs
+      - pods
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: ceph-rgw
+  annotations:
+    "openstackhelm.openstack.org/release_uuid": ""
+  labels:
+    release_group: release-name
+    application: ceph
+    component: rgw
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      release_group: release-name
+      application: ceph
+      component: rgw
+  template:
+    metadata:
+      labels:
+        release_group: release-name
+        application: ceph
+        component: rgw
+      annotations:
+        configmap-bin-hash: "ab6533435eb98c2ef2e686d9a17df326c0419ae7d488b61de800da24f98d8c62"
+        configmap-etc-client-hash: "4188d53b4d5a7fba90f65e679e61c18786dfcd9edd22889091ed7a5a3e298205"
+        "openstackhelm.openstack.org/release_uuid": ""
+    spec:
+      securityContext:
+        runAsUser: 64045
+        
+      serviceAccountName: ceph-rgw
+      affinity:
+        
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: release_group
+                    operator: In
+                    values:
+                    - release-name
+                  - key: application
+                    operator: In
+                    values:
+                    - ceph
+                  - key: component
+                    operator: In
+                    values:
+                    - rgw
+                  
+              topologyKey: kubernetes.io/hostname
+            weight: 10
+      nodeSelector:
+        ceph-rgw: enabled
+      initContainers:
+        
+        - name: init
+          image: "quay.io/airshipit/kubernetes-entrypoint:v1.0.0"
+          imagePullPolicy: IfNotPresent  
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65534
+            
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: INTERFACE_NAME
+              value: eth0
+            - name: PATH
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/
+            - name: DEPENDENCY_SERVICE
+              value: ""
+            - name: DEPENDENCY_JOBS
+              value: "ceph-rgw-storage-init"
+            - name: DEPENDENCY_DAEMONSET
+              value: ""
+            - name: DEPENDENCY_CONTAINER
+              value: ""
+            - name: DEPENDENCY_POD_JSON
+              value: ""
+            - name: DEPENDENCY_CUSTOM_RESOURCE
+              value: ""
+          command:
+            - kubernetes-entrypoint
+          volumeMounts:
+            []
+            
+        - name: ceph-init-dirs
+          image: "docker.io/openstackhelm/ceph-daemon:ubuntu_bionic-20200416"
+          imagePullPolicy: IfNotPresent
+          
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            
+          command:
+            - /tmp/init-dirs.sh
+          env:
+            - name: CLUSTER
+              value: "ceph"
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: pod-run
+              mountPath: /run
+            - name: pod-etc-ceph
+              mountPath: /etc/ceph
+            - name: ceph-rgw-bin
+              mountPath: /tmp/init-dirs.sh
+              subPath: init-dirs.sh
+              readOnly: true
+            - name: pod-var-lib-ceph
+              mountPath: /var/lib/ceph
+              readOnly: false
+        - name: ceph-rgw-init
+          image: "docker.io/openstackhelm/ceph-daemon:ubuntu_bionic-20200416"
+          imagePullPolicy: IfNotPresent
+          
+          
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsUser: 0
+            
+          env:
+            - name: CLUSTER
+              value: "ceph"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+
+            - name: RGW_FRONTEND_PORT
+              value: "8088"
+          command:
+            - /tmp/rgw-init.sh
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: pod-run
+              mountPath: /run
+            - name: pod-etc-ceph
+              mountPath: /etc/ceph
+            - name: ceph-rgw-bin
+              mountPath: /tmp/rgw-init.sh
+              subPath: rgw-init.sh
+              readOnly: true
+            - name: ceph-rgw-etc
+              mountPath: /etc/ceph/ceph.conf.template
+              subPath: ceph.conf
+              readOnly: true
+      containers:
+        - name: ceph-rgw
+          image: "docker.io/openstackhelm/ceph-daemon:ubuntu_bionic-20200416"
+          imagePullPolicy: IfNotPresent
+          
+          
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            
+          env:
+            - name: CLUSTER
+              value: "ceph"
+            - name: RGW_FRONTEND_PORT
+              value: "8088"
+          command:
+            - /tmp/rgw-start.sh
+          ports:
+            - containerPort: 8088
+          livenessProbe:
+              httpGet:
+                path: /
+                port: 8088
+              initialDelaySeconds: 120
+              timeoutSeconds: 5
+          readinessProbe:
+              httpGet:
+                path: /
+                port: 8088
+              timeoutSeconds: 5
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: pod-run
+              mountPath: /run
+            - name: pod-etc-ceph
+              mountPath: /etc/ceph
+            - name: ceph-rgw-bin
+              mountPath: /tmp/rgw-start.sh
+              subPath: rgw-start.sh
+              readOnly: true
+            - name: ceph-rgw-etc
+              mountPath: /etc/ceph/ceph.conf.template
+              subPath: ceph.conf
+              readOnly: true
+            - name: ceph-bootstrap-rgw-keyring
+              mountPath: /var/lib/ceph/bootstrap-rgw/ceph.keyring
+              subPath: ceph.keyring
+              readOnly: false
+            - name: pod-var-lib-ceph
+              mountPath: /var/lib/ceph
+              readOnly: false
+      volumes:
+        - name: pod-tmp
+          emptyDir: {}
+        - name: pod-run
+          emptyDir:
+            medium: "Memory"
+        - name: pod-etc-ceph
+          emptyDir: {}
+        - name: ceph-rgw-bin
+          configMap:
+            name: ceph-rgw-bin
+            defaultMode: 0555
+        - name: ceph-rgw-etc
+          configMap:
+            name: ceph-rgw-etc
+            defaultMode: 0444
+        - name: pod-var-lib-ceph
+          emptyDir: {}
+        - name: ceph-bootstrap-rgw-keyring
+          secret:
+            secretName: os-ceph-bootstrap-rgw-keyring
+
+---
+# Source: ceph-rgw/templates/job-rgw-storage-init.yaml
+
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ceph-rgw-storage-init
+  namespace: osh-infra
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ceph-rgw-storage-init
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - create
+      - update
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ceph-rgw-storage-init
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ceph-rgw-storage-init
+subjects:
+  - kind: ServiceAccount
+    name: ceph-rgw-storage-init
+    namespace: osh-infra
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ceph-rgw-storage-init
+spec:
+  template:
+    metadata:
+      labels:
+        release_group: release-name
+        application: ceph
+        component: rgw-storage-init
+    spec:
+      securityContext:
+        runAsUser: 64045
+        
+      serviceAccountName: ceph-rgw-storage-init
+      restartPolicy: OnFailure
+      nodeSelector:
+        openstack-control-plane: enabled
+      initContainers:
+        
+        - name: init
+          image: "quay.io/airshipit/kubernetes-entrypoint:v1.0.0"
+          imagePullPolicy: IfNotPresent  
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65534
+            
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: INTERFACE_NAME
+              value: eth0
+            - name: PATH
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/
+            - name: DEPENDENCY_SERVICE
+              value: ""
+            - name: DEPENDENCY_DAEMONSET
+              value: ""
+            - name: DEPENDENCY_CONTAINER
+              value: ""
+            - name: DEPENDENCY_POD_JSON
+              value: ""
+            - name: DEPENDENCY_CUSTOM_RESOURCE
+              value: ""
+          command:
+            - kubernetes-entrypoint
+          volumeMounts:
+            []
+            
+        - name: ceph-keyring-placement
+          image: "docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200416"
+          imagePullPolicy: IfNotPresent
+          
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsUser: 0
+            
+          command:
+            - /tmp/ceph-admin-keyring.sh
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: pod-etc-ceph
+              mountPath: /etc/ceph
+            - name: ceph-rgw-bin
+              mountPath: /tmp/ceph-admin-keyring.sh
+              subPath: ceph-admin-keyring.sh
+              readOnly: true
+            - name: ceph-keyring
+              mountPath: /tmp/client-keyring
+              subPath: key
+              readOnly: true
+      containers:
+        - name: ceph-rgw-storage-init
+          image: "docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200416"
+          imagePullPolicy: IfNotPresent
+          
+          
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: STORAGE_BACKEND
+              value: "ceph-rgw"
+          command:
+            - /tmp/storage-init.sh
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: pod-etc-ceph
+              mountPath: /etc/ceph
+            - name: ceph-rgw-bin
+              mountPath: /tmp/storage-init.sh
+              subPath: storage-init.sh
+              readOnly: true
+            - name: ceph-templates
+              mountPath: /tmp/ceph-templates
+              readOnly: true
+            - name: ceph-etc
+              mountPath: /etc/ceph/ceph.conf
+              subPath: ceph.conf
+              readOnly: true
+            - name: ceph-keyring
+              mountPath: /tmp/client-keyring
+              subPath: key
+              readOnly: true
+      volumes:
+        - name: pod-tmp
+          emptyDir: {}
+        - name: pod-etc-ceph
+          emptyDir: {}
+        - name: ceph-rgw-bin
+          configMap:
+            name: ceph-rgw-bin
+            defaultMode: 0555
+        - name: ceph-etc
+          configMap:
+            name: ceph-etc
+            defaultMode: 0444
+        - name: ceph-templates
+          configMap:
+            name: "release-name-ceph-templates"
+            defaultMode: 0444
+        - name: ceph-keyring
+          secret:
+            secretName: "pvc-ceph-client-key"
+
+---
+# Source: ceph-rgw/templates/job-s3-admin.yaml
+
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rgw-s3-admin
+  namespace: osh-infra
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: release-name-rgw-s3-admin
+  namespace: osh-infra
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: release-name-osh-infra-rgw-s3-admin
+subjects:
+  - kind: ServiceAccount
+    name: rgw-s3-admin
+    namespace: osh-infra
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: release-name-osh-infra-rgw-s3-admin
+  namespace: osh-infra
+rules:
+  - apiGroups:
+      - ""
+      - extensions
+      - batch
+      - apps
+    verbs:
+      - get
+      - list
+    resources:
+      - services
+      - endpoints
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rgw-s3-admin
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - create
+      - update
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rgw-s3-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rgw-s3-admin
+subjects:
+  - kind: ServiceAccount
+    name: rgw-s3-admin
+    namespace: osh-infra
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ceph-rgw-s3-admin
+  annotations:
+    "openstackhelm.openstack.org/release_uuid": ""
+spec:
+  template:
+    metadata:
+      labels:
+        release_group: release-name
+        application: ceph
+        component: rgw-s3-admin
+    spec:
+      securityContext:
+        runAsUser: 64045
+        
+      serviceAccountName: rgw-s3-admin
+      restartPolicy: OnFailure
+      nodeSelector:
+        openstack-control-plane: enabled
+      initContainers:
+        
+        - name: init
+          image: "quay.io/airshipit/kubernetes-entrypoint:v1.0.0"
+          imagePullPolicy: IfNotPresent  
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65534
+            
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: INTERFACE_NAME
+              value: eth0
+            - name: PATH
+              value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/
+            - name: DEPENDENCY_SERVICE
+              value: "osh-infra:ceph-rgw"
+            - name: DEPENDENCY_DAEMONSET
+              value: ""
+            - name: DEPENDENCY_CONTAINER
+              value: ""
+            - name: DEPENDENCY_POD_JSON
+              value: ""
+            - name: DEPENDENCY_CUSTOM_RESOURCE
+              value: ""
+          command:
+            - kubernetes-entrypoint
+          volumeMounts:
+            []
+            
+        - name: ceph-keyring-placement
+          image: "docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200416"
+          imagePullPolicy: IfNotPresent
+          
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsUser: 0
+            
+          command:
+            - /tmp/ceph-admin-keyring.sh
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: pod-etc-ceph
+              mountPath: /etc/ceph
+            - name: ceph-rgw-bin
+              mountPath: /tmp/ceph-admin-keyring.sh
+              subPath: ceph-admin-keyring.sh
+              readOnly: true
+            - name: ceph-keyring
+              mountPath: /tmp/client-keyring
+              subPath: key
+              readOnly: true
+      containers:
+        - name: create-s3-admin
+          image: docker.io/openstackhelm/ceph-config-helper:ubuntu_bionic-20200416
+          imagePullPolicy: IfNotPresent
+          
+          
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            
+          env:
+            - name: S3_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: radosgw-s3-admin-creds
+                  key: S3_ADMIN_USERNAME
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: radosgw-s3-admin-creds
+                  key: S3_ADMIN_ACCESS_KEY
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: radosgw-s3-admin-creds
+                  key: S3_ADMIN_SECRET_KEY
+          command:
+            - /tmp/rgw-s3-admin.sh
+          volumeMounts:
+            - name: pod-tmp
+              mountPath: /tmp
+            - name: pod-etc-ceph
+              mountPath: /etc/ceph
+            - name: ceph-rgw-bin
+              mountPath: /tmp/rgw-s3-admin.sh
+              subPath: rgw-s3-admin.sh
+              readOnly: true
+            - name: ceph-rgw-etc
+              mountPath: /etc/ceph/ceph.conf
+              subPath: ceph.conf
+              readOnly: true
+            - name: ceph-keyring
+              mountPath: /tmp/client-keyring
+              subPath: key
+              readOnly: true
+      volumes:
+        - name: pod-tmp
+          emptyDir: {}
+        - name: pod-etc-ceph
+          emptyDir: {}
+        - name: ceph-rgw-bin
+          configMap:
+            name: ceph-rgw-bin
+            defaultMode: 0555
+        - name: ceph-rgw-etc
+          configMap:
+            name: ceph-rgw-etc
+            defaultMode: 0444
+        - name: ceph-keyring
+          secret:
+            secretName: "pvc-ceph-client-key"
+
+---
+# Source: ceph-rgw/templates/pod-helm-tests.yaml
+
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: release-name-test
+  namespace: osh-infra
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: release-name-release-name-test
+  namespace: osh-infra
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: release-name-osh-infra-release-name-test
+subjects:
+  - kind: ServiceAccount
+    name: release-name-test
+    namespace: osh-infra
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: release-name-osh-infra-release-name-test
+  namespace: osh-infra
+rules:
+  - apiGroups:
+      - ""
+      - extensions
+      - batch
+      - apps
+    verbs:
+      - get
+      - list
+    resources:
+      - services
+      - endpoints
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: release-name-test
+  labels:
+    release_group: release-name
+    application: ceph
+    component: rgw-test
+  annotations:
+    "helm.sh/hook": test-success
+spec:
+  restartPolicy: Never
+  serviceAccountName: release-name-test
+  nodeSelector:
+    openstack-control-plane: enabled
+  containers:
+
+
+    - name: ceph-rgw-s3-validation
+      image: "docker.io/openstackhelm/ceph-daemon:ubuntu_bionic-20200416"
+      imagePullPolicy: IfNotPresent
+      
+      env:        
+        - name: S3_ADMIN_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: radosgw-s3-admin-creds
+              key: S3_ADMIN_USERNAME
+        - name: S3_ADMIN_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: radosgw-s3-admin-creds
+              key: S3_ADMIN_ACCESS_KEY
+        - name: S3_ADMIN_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: radosgw-s3-admin-creds
+              key: S3_ADMIN_SECRET_KEY
+        - name: RGW_HOST
+          value: ceph-rgw.osh-infra.svc.cluster.local:8088
+        - name: "RGW_TEST_TYPE"
+          value: "RGW_S3"
+      command:
+        - /tmp/helm-tests.sh
+      volumeMounts:
+        - name: pod-tmp
+          mountPath: /tmp
+        - name: pod-etc-ceph
+          mountPath: /etc/ceph
+        - name: ceph-rgw-bin
+          mountPath: /tmp/helm-tests.sh
+          subPath: helm-tests.sh
+          readOnly: true
+  volumes:
+    - name: pod-tmp
+      emptyDir: {}
+    - name: pod-etc-ceph
+      emptyDir: {}
+    - name: ceph-rgw-bin
+      configMap:
+        name: ceph-rgw-bin
+        defaultMode: 0555
+    - name: ceph-keyring
+      secret:
+        secretName: "pvc-ceph-client-key"
+    - name: ceph-rgw-etc
+      configMap:
+        name: ceph-rgw-etc
+        defaultMode: 0444
+
+---
+# Source: ceph-rgw/templates/service-ingress-rgw.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: radosgw
+spec:
+  ports:
+    - name: http
+      port: 80
+    - name: https
+      port: 443
+  selector:
+    app: ingress-api
+
+---
+# Source: ceph-rgw/templates/service-rgw.yaml
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ceph-rgw
+spec:
+  ports:
+  - name: ceph-rgw
+    port: 8088
+    protocol: TCP
+    targetPort: 8088
+  
+  selector:
+    release_group: release-name
+    application: ceph
+    component: rgw
+  
+
+---
+# Source: ceph-rgw/templates/ingress-rgw.yaml
+
+---
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: radosgw
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-max-temp-file-size: "0"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    
+spec:
+  rules:
+    - host: radosgw
+      http:
+        paths:
+          - path: /
+            backend:
+              serviceName: ceph-rgw
+              servicePort: ceph-rgw
+    - host: radosgw.osh-infra
+      http:
+        paths:
+          - path: /
+            backend:
+              serviceName: ceph-rgw
+              servicePort: ceph-rgw
+    - host: radosgw.osh-infra.svc.cluster.local
+      http:
+        paths:
+          - path: /
+            backend:
+              serviceName: ceph-rgw
+              servicePort: ceph-rgw
